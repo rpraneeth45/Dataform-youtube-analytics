@@ -1,0 +1,58 @@
+config {
+  type: "incremental",
+  schema: "silver",
+  name: "silver_mcn_group",
+  description: "Multi-Channel Network (MCN) groups - daily snapshot",
+  tags: ["silver", "mcn"],
+  
+  bigquery: {
+    partitionBy: "snapshot_date",
+    clusterBy: ["mcn_group_id"],
+    updatePartitionFilter: "snapshot_date >= DATE_SUB(CURRENT_DATE(), INTERVAL 7 DAY)"
+  },
+  
+  columns: {
+    mcn_group_id: "MCN group identifier",
+    mcn_group_name: "MCN display name",
+    created_at: "MCN creation timestamp",
+    snapshot_date: "Date of data snapshot (partition key)"
+  }
+}
+
+/*
+ * Transform MCN registry to Silver layer with daily snapshots
+ * 
+ * Source: control.mcn_registry (control table)
+ * Target: silver.silver_mcn_group (native BigQuery table)
+ * 
+ * Purpose:
+ * - Create date-partitioned history of MCN groups
+ * - Track MCN metadata over time
+ * - Enable time-travel queries on MCN changes
+ * 
+ * Note: 
+ * - MCN registry is slowly-changing dimension (SCD Type 2)
+ * - This creates daily snapshots for consistency with channel data
+ */
+
+SELECT
+  mcn_id AS mcn_group_id,
+  mcn_name AS mcn_group_name,
+  created_at,
+  
+  -- Use target_date from DAG parameter for consistent snapshot dates
+  ${ when(dataform.projectConfig.vars.target_date, 
+    `PARSE_DATE('%Y-%m-%d', '${dataform.projectConfig.vars.target_date}') AS snapshot_date`
+  ) }
+  
+  ${ when(!dataform.projectConfig.vars.target_date, 
+    `CURRENT_DATE() AS snapshot_date`
+  ) }
+
+FROM 
+  ${ref("control", "mcn_registry")}
+
+WHERE
+  -- Only include active MCNs
+  is_active = TRUE
+

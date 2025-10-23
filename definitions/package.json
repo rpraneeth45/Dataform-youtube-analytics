@@ -1,0 +1,56 @@
+
+declare({
+  database: "tonal-transit-475913-a2",
+  schema: "control",
+  name: "bronze_channels_external"
+});
+
+declare({
+  database: "tonal-transit-475913-a2",
+  schema: "control",
+  name: "bronze_videos_external"
+});
+
+declare({
+  database: "tonal-transit-475913-a2",
+  schema: "control",
+  name: "bronze_playlists_external"
+});
+
+declare({
+  database: "tonal-transit-475913-a2",
+  schema: "control",
+  name: "bronze_playlist_items_external"
+});
+
+// Control tables (managed by Python/SQL, not Dataform)
+declare({
+  database: "tonal-transit-475913-a2",
+  schema: "control",
+  name: "channels_registry"
+});
+
+declare({
+  database: "tonal-transit-475913-a2",
+  schema: "control",
+  name: "mcn_registry"
+});
+
+declare({
+  database: "tonal-transit-475913-a2",
+  schema: "control",
+  name: "ingestion_run_channels"
+});
+
+declare({
+  database: "tonal-transit-475913-a2",
+  schema: "control",
+  name: "ingestion_runs"
+});
+
+declare({
+  database: "tonal-transit-475913-a2",
+  schema: "control",
+  name: "quota_tracker"
+});
+

@@ -1,0 +1,5 @@
+defaultProject: tonal-transit-475913-a2
+defaultDataset: silver
+defaultAssertionDataset: dataform_assertions
+dataformCoreVersion: 3.0.26
+

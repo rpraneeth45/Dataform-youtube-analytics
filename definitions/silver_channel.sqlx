@@ -1,0 +1,90 @@
+config {
+  type: "incremental",
+  schema: "silver",
+  name: "silver_channel",
+  description: "YouTube channel metadata with statistics",
+  tags: ["silver", "channels"],
+  
+  bigquery: {
+    partitionBy: "snapshot_date",
+    clusterBy: ["channel_id"],
+    updatePartitionFilter: "snapshot_date >= DATE_SUB(CURRENT_DATE(), INTERVAL 7 DAY)"
+  },
+  
+  columns: {
+    channel_id: "YouTube channel ID (primary key with snapshot_date)",
+    channel_title: "Channel display name",
+    mcn_group_id: "Multi-Channel Network group identifier",
+    country: "Channel country code",
+    created_at: "Channel creation timestamp",
+    is_active: "Whether channel is currently active",
+    subscriber_count: "Total subscriber count",
+    view_count_total: "Total view count across all videos",
+    video_count_total: "Total number of videos published",
+    snapshot_date: "Date of data snapshot (partition key)"
+  }
+}
+
+/*
+ * Transform Bronze channel data to Silver layer
+ * 
+ * Source: control.bronze_channels_external (GCS external table)
+ * Target: silver.silver_channel (native BigQuery table)
+ * 
+ * Transformations:
+ * - Parse nested JSON structure from YouTube API
+ * - Extract channel metadata and statistics
+ * - Join with MCN registry for mcn_group_id
+ * - Clean and type-cast fields
+ * 
+ * Incremental Logic:
+ * - Updates partitions from last 7 days (configurable)
+ * - Full refresh available by removing incremental config
+ */
+
+SELECT
+  -- Identifiers
+  JSON_EXTRACT_SCALAR(item, '$.id') AS channel_id,
+  JSON_EXTRACT_SCALAR(item, '$.snippet.title') AS channel_title,
+  
+  -- MCN Group (join with registry)
+  mcn.mcn_id AS mcn_group_id,
+  
+  -- Channel Metadata
+  JSON_EXTRACT_SCALAR(item, '$.snippet.country') AS country,
+  PARSE_TIMESTAMP('%Y-%m-%dT%H:%M:%SZ', JSON_EXTRACT_SCALAR(item, '$.snippet.publishedAt')) AS created_at,
+  
+  -- Status
+  CAST(JSON_EXTRACT_SCALAR(item, '$.status.isLinked') AS BOOL) AS is_active,
+  
+  -- Statistics (use SAFE_CAST to handle nulls/errors)
+  SAFE_CAST(JSON_EXTRACT_SCALAR(item, '$.statistics.subscriberCount') AS INT64) AS subscriber_count,
+  SAFE_CAST(JSON_EXTRACT_SCALAR(item, '$.statistics.viewCount') AS INT64) AS view_count_total,
+  SAFE_CAST(JSON_EXTRACT_SCALAR(item, '$.statistics.videoCount') AS INT64) AS video_count_total,
+  
+  -- Partition Key
+  PARSE_DATE('%Y-%m-%d', JSON_EXTRACT_SCALAR(bronze, '$.snapshot_date')) AS snapshot_date
+
+FROM 
+  ${ref("control", "bronze_channels_external")} AS bronze,
+  UNNEST(JSON_EXTRACT_ARRAY(bronze, '$.items')) AS item
+
+-- Join with MCN registry to get mcn_group_id
+LEFT JOIN ${ref("control", "channels_registry")} AS registry
+  ON JSON_EXTRACT_SCALAR(item, '$.id') = registry.channel_id
+LEFT JOIN ${ref("control", "mcn_registry")} AS mcn
+  ON registry.mcn_id = mcn.mcn_id
+
+WHERE
+  -- Only process records with valid channel IDs
+  JSON_EXTRACT_SCALAR(item, '$.id') IS NOT NULL
+  
+  -- Date filter: process specific date from DAG parameter
+  ${ when(dataform.projectConfig.vars.target_date, 
+    `AND PARSE_DATE('%Y-%m-%d', JSON_EXTRACT_SCALAR(bronze, '$.snapshot_date')) = '${dataform.projectConfig.vars.target_date}'`
+  ) }
+  
+  -- Incremental filter: only reprocess recent partitions if no target_date specified
+  ${ when(incremental() && !dataform.projectConfig.vars.target_date, 
+    `AND PARSE_DATE('%Y-%m-%d', JSON_EXTRACT_SCALAR(bronze, '$.snapshot_date')) >= DATE_SUB(CURRENT_DATE(), INTERVAL 7 DAY)`) }
+

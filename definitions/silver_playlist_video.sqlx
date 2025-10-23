@@ -1,0 +1,93 @@
+config {
+  type: "incremental",
+  schema: "silver",
+  name: "silver_playlist_video",
+  description: "Mapping of videos to playlists with position tracking",
+  tags: ["silver", "playlists", "videos"],
+  
+  bigquery: {
+    partitionBy: "snapshot_date",
+    clusterBy: ["playlist_id", "video_id"],
+    updatePartitionFilter: "snapshot_date >= DATE_SUB(CURRENT_DATE(), INTERVAL 7 DAY)"
+  },
+  
+  columns: {
+    playlist_id: "YouTube playlist ID",
+    video_id: "YouTube video ID",
+    position: "Position of video in playlist (0-indexed)",
+    is_current: "Whether this is the most recent snapshot for this playlist-video pair",
+    snapshot_date: "Date of data snapshot (partition key)"
+  }
+}
+
+/*
+ * Transform Bronze playlist items to Silver layer
+ * 
+ * Source: control.bronze_playlist_items_external (GCS external table)
+ * Target: silver.silver_playlist_video (native BigQuery table)
+ * 
+ * Transformations:
+ * - Parse nested JSON from YouTube API
+ * - Extract playlist-video relationships
+ * - Track position in playlist
+ * - Mark current snapshot (most recent for each playlist-video pair)
+ */
+
+WITH playlist_items AS (
+  SELECT
+    -- Identifiers
+    JSON_EXTRACT_SCALAR(bronze, '$.playlist_id') AS playlist_id,
+    JSON_EXTRACT_SCALAR(item, '$.contentDetails.videoId') AS video_id,
+    
+    -- Position
+    SAFE_CAST(JSON_EXTRACT_SCALAR(item, '$.snippet.position') AS INT64) AS position,
+    
+    -- Partition Key
+    PARSE_DATE('%Y-%m-%d', JSON_EXTRACT_SCALAR(bronze, '$.snapshot_date')) AS snapshot_date
+  
+  FROM 
+    ${ref("control", "bronze_playlist_items_external")} AS bronze,
+    UNNEST(JSON_EXTRACT_ARRAY(bronze, '$.items')) AS item
+  
+  WHERE
+    -- Only process records with valid IDs
+    JSON_EXTRACT_SCALAR(bronze, '$.playlist_id') IS NOT NULL
+    AND JSON_EXTRACT_SCALAR(item, '$.contentDetails.videoId') IS NOT NULL
+    
+    -- Date filter: process specific date from DAG parameter
+    ${ when(dataform.projectConfig.vars.target_date, 
+      `AND PARSE_DATE('%Y-%m-%d', JSON_EXTRACT_SCALAR(bronze, '$.snapshot_date')) = '${dataform.projectConfig.vars.target_date}'`
+    ) }
+    
+    -- Incremental filter if no target_date specified
+    ${ when(incremental() && !dataform.projectConfig.vars.target_date, 
+      `AND PARSE_DATE('%Y-%m-%d', JSON_EXTRACT_SCALAR(bronze, '$.snapshot_date')) >= DATE_SUB(CURRENT_DATE(), INTERVAL 7 DAY)`) }
+),
+
+latest_snapshots AS (
+  SELECT
+    playlist_id,
+    video_id,
+    MAX(snapshot_date) AS latest_snapshot_date
+  FROM playlist_items
+  GROUP BY playlist_id, video_id
+)
+
+SELECT
+  pi.playlist_id,
+  pi.video_id,
+  pi.position,
+  
+  -- Mark as current if this is the latest snapshot for this playlist-video pair
+  CASE 
+    WHEN pi.snapshot_date = ls.latest_snapshot_date THEN TRUE 
+    ELSE FALSE 
+  END AS is_current,
+  
+  pi.snapshot_date
+
+FROM playlist_items pi
+LEFT JOIN latest_snapshots ls
+  ON pi.playlist_id = ls.playlist_id
+  AND pi.video_id = ls.video_id
+

@@ -1,0 +1,86 @@
+config {
+  type: "incremental",
+  schema: "silver",
+  name: "silver_ingestion_log",
+  description: "Ingestion status log by channel with error tracking",
+  tags: ["silver", "monitoring"],
+  
+  bigquery: {
+    partitionBy: "snapshot_date",
+    clusterBy: ["channel_id"],
+    updatePartitionFilter: "snapshot_date >= DATE_SUB(CURRENT_DATE(), INTERVAL 7 DAY)"
+  },
+  
+  columns: {
+    channel_id: "YouTube channel ID",
+    last_ingest_at: "Timestamp of last ingestion attempt",
+    error_flag: "Whether last ingestion had errors",
+    snapshot_date: "Date of data snapshot (partition key)"
+  }
+}
+
+/*
+ * Transform ingestion run results to Silver monitoring layer
+ * 
+ * Source: control.ingestion_run_channels (control table)
+ * Target: silver.silver_ingestion_log (native BigQuery table)
+ * 
+ * Purpose:
+ * - Track ingestion success/failure by channel
+ * - Enable monitoring and alerting
+ * - Identify channels with persistent errors
+ * 
+ * Aggregation:
+ * - Groups by channel_id and run_date
+ * - Takes most recent run per day
+ * - Marks error if status is not 'success'
+ */
+
+WITH ranked_runs AS (
+  SELECT
+    channel_id,
+    run_date,
+    status,
+    error_message,
+    run_id,
+    
+    -- Rank runs by run_id descending (most recent first)
+    -- run_id is UUID, so we use it for deterministic ordering
+    ROW_NUMBER() OVER (
+      PARTITION BY channel_id, run_date 
+      ORDER BY run_id DESC
+    ) AS rn
+  
+  FROM ${ref("control", "ingestion_run_channels")}
+  
+  WHERE
+    -- Date filter: process specific date from DAG parameter
+    ${ when(dataform.projectConfig.vars.target_date, 
+      `run_date = '${dataform.projectConfig.vars.target_date}'`
+    ) }
+    
+    -- Incremental filter if no target_date specified
+    ${ when(incremental() && !dataform.projectConfig.vars.target_date, 
+      `run_date >= DATE_SUB(CURRENT_DATE(), INTERVAL 7 DAY)`) }
+)
+
+SELECT
+  channel_id,
+  
+  -- Use run_date as timestamp (no finer granularity available)
+  TIMESTAMP(run_date) AS last_ingest_at,
+  
+  -- Error flag: true if status is not 'success'
+  CASE 
+    WHEN status IN ('failed', 'partial') THEN TRUE 
+    ELSE FALSE 
+  END AS error_flag,
+  
+  run_date AS snapshot_date
+
+FROM ranked_runs
+
+WHERE 
+  -- Only keep the most recent run per channel per day
+  rn = 1
+

@@ -66,8 +66,8 @@ SELECT
   PARSE_DATE('%Y-%m-%d', JSON_EXTRACT_SCALAR(bronze, '$.snapshot_date')) AS snapshot_date
 
 FROM 
-  ${ref("control", "bronze_channels_external")} AS bronze,
-  UNNEST(JSON_EXTRACT_ARRAY(bronze, '$.items')) AS item
+  ${ref("control", "bronze_channels_external")} AS bronze
+CROSS JOIN UNNEST(JSON_EXTRACT_ARRAY(bronze, '$.items')) AS item
 
 -- Join with MCN registry to get mcn_group_id
 LEFT JOIN ${ref("control", "channels_registry")} AS registry

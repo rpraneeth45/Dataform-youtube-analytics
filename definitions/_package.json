@@ -23,7 +23,6 @@ declare({
   name: "bronze_playlist_items_external"
 });
 
-// Control tables (managed by Python/SQL, not Dataform)
 declare({
   database: "tonal-transit-475913-a2",
   schema: "control",

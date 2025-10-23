@@ -63,8 +63,8 @@ SELECT
   item.statistics.viewCount AS view_count_total,
   item.statistics.videoCount AS video_count_total,
   
-  -- Partition Key (from Hive partition)
-  PARSE_DATE('%Y-%m-%d', bronze.snapshot_date) AS snapshot_date
+  -- Partition Key (from Hive partition - already a DATE)
+  bronze.snapshot_date AS snapshot_date
 
 FROM 
   `tonal-transit-475913-a2.control.bronze_channels_external` AS bronze
@@ -82,10 +82,10 @@ WHERE
   
   -- Date filter: process specific date from DAG parameter
   ${ when(dataform.projectConfig.vars.target_date, 
-    `AND PARSE_DATE('%Y-%m-%d', bronze.snapshot_date) = '${dataform.projectConfig.vars.target_date}'`
+    `AND bronze.snapshot_date = PARSE_DATE('%Y-%m-%d', '${dataform.projectConfig.vars.target_date}')`
   ) }
   
   -- Incremental filter: only reprocess recent partitions if no target_date specified
   ${ when(incremental() && !dataform.projectConfig.vars.target_date, 
-    `AND PARSE_DATE('%Y-%m-%d', bronze.snapshot_date) >= DATE_SUB(CURRENT_DATE(), INTERVAL 7 DAY)`) }
+    `AND bronze.snapshot_date >= DATE_SUB(CURRENT_DATE(), INTERVAL 7 DAY)`) }
 

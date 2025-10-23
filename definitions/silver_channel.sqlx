@@ -1,3 +1,4 @@
+
 config {
   type: "incremental",
   schema: "silver",

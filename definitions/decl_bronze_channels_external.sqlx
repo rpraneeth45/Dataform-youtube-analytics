@@ -1,0 +1,7 @@
+config {
+  type: "declaration",
+  schema: "control",
+  name: "bronze_channels_external"
+}
+
+

@@ -45,47 +45,47 @@ config {
 
 SELECT
   -- Identifiers
-  JSON_EXTRACT_SCALAR(item, '$.id') AS channel_id,
-  JSON_EXTRACT_SCALAR(item, '$.snippet.title') AS channel_title,
+  item.id AS channel_id,
+  item.snippet.title AS channel_title,
   
   -- MCN Group (join with registry)
   mcn.mcn_id AS mcn_group_id,
   
   -- Channel Metadata
-  JSON_EXTRACT_SCALAR(item, '$.snippet.country') AS country,
-  PARSE_TIMESTAMP('%Y-%m-%dT%H:%M:%SZ', JSON_EXTRACT_SCALAR(item, '$.snippet.publishedAt')) AS created_at,
+  item.snippet.country AS country,
+  PARSE_TIMESTAMP('%Y-%m-%dT%H:%M:%SZ', item.snippet.publishedAt) AS created_at,
   
   -- Status
-  CAST(JSON_EXTRACT_SCALAR(item, '$.status.isLinked') AS BOOL) AS is_active,
+  COALESCE(item.status.isLinked, TRUE) AS is_active,
   
-  -- Statistics (use SAFE_CAST to handle nulls/errors)
-  SAFE_CAST(JSON_EXTRACT_SCALAR(item, '$.statistics.subscriberCount') AS INT64) AS subscriber_count,
-  SAFE_CAST(JSON_EXTRACT_SCALAR(item, '$.statistics.viewCount') AS INT64) AS view_count_total,
-  SAFE_CAST(JSON_EXTRACT_SCALAR(item, '$.statistics.videoCount') AS INT64) AS video_count_total,
+  -- Statistics
+  item.statistics.subscriberCount AS subscriber_count,
+  item.statistics.viewCount AS view_count_total,
+  item.statistics.videoCount AS video_count_total,
   
-  -- Partition Key
-  PARSE_DATE('%Y-%m-%d', JSON_EXTRACT_SCALAR(bronze, '$.snapshot_date')) AS snapshot_date
+  -- Partition Key (from Hive partition)
+  PARSE_DATE('%Y-%m-%d', bronze.snapshot_date) AS snapshot_date
 
 FROM 
   `tonal-transit-475913-a2.control.bronze_channels_external` AS bronze
-CROSS JOIN UNNEST(JSON_EXTRACT_ARRAY(bronze, '$.items')) AS item
+CROSS JOIN UNNEST(bronze.items) AS item
 
 -- Join with MCN registry to get mcn_group_id
 LEFT JOIN `tonal-transit-475913-a2.control.channels_registry` AS registry
-  ON JSON_EXTRACT_SCALAR(item, '$.id') = registry.channel_id
+  ON item.id = registry.channel_id
 LEFT JOIN `tonal-transit-475913-a2.control.mcn_registry` AS mcn
   ON registry.mcn_id = mcn.mcn_id
 
 WHERE
   -- Only process records with valid channel IDs
-  JSON_EXTRACT_SCALAR(item, '$.id') IS NOT NULL
+  item.id IS NOT NULL
   
   -- Date filter: process specific date from DAG parameter
   ${ when(dataform.projectConfig.vars.target_date, 
-    `AND PARSE_DATE('%Y-%m-%d', JSON_EXTRACT_SCALAR(bronze, '$.snapshot_date')) = '${dataform.projectConfig.vars.target_date}'`
+    `AND PARSE_DATE('%Y-%m-%d', bronze.snapshot_date) = '${dataform.projectConfig.vars.target_date}'`
   ) }
   
   -- Incremental filter: only reprocess recent partitions if no target_date specified
   ${ when(incremental() && !dataform.projectConfig.vars.target_date, 
-    `AND PARSE_DATE('%Y-%m-%d', JSON_EXTRACT_SCALAR(bronze, '$.snapshot_date')) >= DATE_SUB(CURRENT_DATE(), INTERVAL 7 DAY)`) }
+    `AND PARSE_DATE('%Y-%m-%d', bronze.snapshot_date) >= DATE_SUB(CURRENT_DATE(), INTERVAL 7 DAY)`) }
 

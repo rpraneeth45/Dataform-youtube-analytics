@@ -1,7 +1,6 @@
 config {
   type: "declaration",
+  database: "tonal-transit-475913-a2",
   schema: "control",
   name: "bronze_playlist_items_external"
 }
-
-

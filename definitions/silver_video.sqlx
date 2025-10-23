@@ -114,8 +114,8 @@ SELECT
   PARSE_DATE('%Y-%m-%d', JSON_EXTRACT_SCALAR(bronze, '$.snapshot_date')) AS snapshot_date
 
 FROM 
-  ${ref("control", "bronze_videos_external")} AS bronze,
-  UNNEST(JSON_EXTRACT_ARRAY(bronze, '$.items')) AS item
+  `tonal-transit-475913-a2.control.bronze_videos_external` AS bronze
+CROSS JOIN UNNEST(JSON_EXTRACT_ARRAY(bronze, '$.items')) AS item
 
 WHERE
   -- Only process records with valid video IDs

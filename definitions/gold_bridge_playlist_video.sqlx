@@ -1,0 +1,69 @@
+config {
+  type: "incremental",
+  schema: "gold",
+  name: "bridge_playlist_video",
+  description: "Bridge table: playlist to video mapping",
+  tags: ["gold", "bridge", "playlist", "video"],
+  
+  bigquery: {
+    clusterBy: ["playlist_sk", "video_sk"]
+  }
+}
+
+/*
+ * Bridge table for playlist-video relationships
+ * Maps playlists to videos with current status tracking
+ */
+
+WITH playlist_video_data AS (
+  SELECT
+    pv.playlist_id,
+    pv.video_id,
+    pv.position,
+    pv.is_current,
+    pv.snapshot_date
+  FROM ${ref("silver", "silver_playlist_video")} pv
+  WHERE pv.playlist_id IS NOT NULL 
+    AND pv.video_id IS NOT NULL
+),
+
+-- Get current playlist and video surrogate keys
+playlist_lookup AS (
+  SELECT
+    playlist_sk,
+    playlist_id,
+    is_current
+  FROM ${ref("gold", "dim_playlist")}
+  WHERE is_current = TRUE
+),
+
+video_lookup AS (
+  SELECT
+    video_sk,
+    video_id,
+    is_current
+  FROM ${ref("gold", "dim_video")}
+  WHERE is_current = TRUE
+),
+
+bridge_data AS (
+  SELECT
+    pv.playlist_id,
+    pv.video_id,
+    pv.position,
+    pv.is_current,
+    pv.snapshot_date,
+    pl.playlist_sk,
+    vl.video_sk
+  FROM playlist_video_data pv
+  LEFT JOIN playlist_lookup pl ON pv.playlist_id = pl.playlist_id
+  LEFT JOIN video_lookup vl ON pv.video_id = vl.video_id
+  WHERE pl.playlist_sk IS NOT NULL 
+    AND vl.video_sk IS NOT NULL
+)
+
+SELECT
+  playlist_sk,
+  video_sk,
+  is_current
+FROM bridge_data

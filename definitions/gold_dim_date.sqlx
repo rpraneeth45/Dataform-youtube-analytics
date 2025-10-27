@@ -1,0 +1,45 @@
+config {
+  type: "table",
+  schema: "gold",
+  name: "dim_date",
+  description: "Date dimension table for analytics",
+  tags: ["gold", "dimension", "date"]
+}
+
+/*
+ * Date dimension table
+ * Creates a comprehensive date dimension for analytics
+ * Includes business calendar attributes
+ */
+
+WITH date_series AS (
+  SELECT
+    date_value
+  FROM UNNEST(GENERATE_DATE_ARRAY(
+    DATE('2020-01-01'), 
+    DATE_ADD(CURRENT_DATE(), INTERVAL 2 YEAR),
+    INTERVAL 1 DAY
+  )) AS date_value
+)
+
+SELECT
+  -- Primary key: YYYYMMDD format
+  CAST(FORMAT_DATE('%Y%m%d', date_value) AS INT64) AS date_key,
+  
+  -- Full date
+  date_value AS full_date,
+  
+  -- Day attributes
+  EXTRACT(DAYOFWEEK FROM date_value) AS day_of_week,
+  EXTRACT(WEEK FROM date_value) AS week,
+  EXTRACT(MONTH FROM date_value) AS month,
+  EXTRACT(QUARTER FROM date_value) AS quarter,
+  EXTRACT(YEAR FROM date_value) AS year,
+  
+  -- Business logic
+  CASE 
+    WHEN EXTRACT(DAYOFWEEK FROM date_value) IN (1, 7) THEN TRUE 
+    ELSE FALSE 
+  END AS is_weekend
+
+FROM date_series

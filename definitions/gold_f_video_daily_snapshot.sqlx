@@ -1,0 +1,88 @@
+config {
+  type: "incremental",
+  schema: "gold",
+  name: "f_video_daily_snapshot",
+  description: "Video daily snapshot with cumulative metrics and deltas",
+  tags: ["gold", "fact", "video", "snapshot"],
+  
+  bigquery: {
+    clusterBy: ["date_key", "video_sk"]
+  }
+}
+
+/*
+ * Video daily snapshot fact table
+ * Provides cumulative metrics and calculated deltas for video performance
+ */
+
+WITH video_data AS (
+  SELECT
+    video_id,
+    view_count,
+    like_count,
+    comment_count,
+    snapshot_date
+  FROM ${ref("silver", "silver_video")}
+  WHERE video_id IS NOT NULL
+),
+
+video_lookup AS (
+  SELECT
+    video_sk,
+    video_id,
+    is_current
+  FROM ${ref("gold", "dim_video")}
+  WHERE is_current = TRUE
+),
+
+video_with_sk AS (
+  SELECT
+    v.video_id,
+    v.view_count,
+    v.like_count,
+    v.comment_count,
+    v.snapshot_date,
+    vl.video_sk
+  FROM video_data v
+  LEFT JOIN video_lookup vl ON v.video_id = vl.video_id
+  WHERE vl.video_sk IS NOT NULL
+),
+
+-- Calculate deltas by comparing with previous day
+video_with_deltas AS (
+  SELECT
+    video_sk,
+    snapshot_date,
+    view_count,
+    like_count,
+    comment_count,
+    
+    -- Calculate deltas
+    view_count - LAG(view_count) OVER (
+      PARTITION BY video_sk 
+      ORDER BY snapshot_date
+    ) AS view_delta,
+    
+    like_count - LAG(like_count) OVER (
+      PARTITION BY video_sk 
+      ORDER BY snapshot_date
+    ) AS like_delta,
+    
+    comment_count - LAG(comment_count) OVER (
+      PARTITION BY video_sk 
+      ORDER BY snapshot_date
+    ) AS comment_delta
+    
+  FROM video_with_sk
+)
+
+SELECT
+  CAST(FORMAT_DATE('%Y%m%d', snapshot_date) AS INT64) AS date_key,
+  video_sk,
+  view_count AS view_count_total,
+  like_count AS like_count_total,
+  comment_count AS comment_count_total,
+  COALESCE(view_delta, 0) AS view_delta,
+  COALESCE(like_delta, 0) AS like_delta,
+  COALESCE(comment_delta, 0) AS comment_delta
+FROM video_with_deltas

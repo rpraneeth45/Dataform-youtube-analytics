@@ -1,0 +1,34 @@
+config {
+  type: "table",
+  schema: "gold",
+  name: "dim_mcn_group",
+  description: "MCN grouping dimension",
+  tags: ["gold", "dimension", "mcn"]
+}
+
+/*
+ * MCN Group dimension table
+ * Creates a dimension for Multi-Channel Network groups
+ * Uses surrogate keys for better performance
+ */
+
+WITH mcn_data AS (
+  SELECT DISTINCT
+    mcn_group_id,
+    mcn_group_name
+  FROM ${ref("silver", "silver_mcn_group")}
+  WHERE mcn_group_id IS NOT NULL
+),
+
+mcn_with_sk AS (
+  SELECT
+    ROW_NUMBER() OVER (ORDER BY mcn_group_id) AS mcn_group_sk,
+    mcn_group_id,
+    mcn_group_name
+  FROM mcn_data
+)
+
+SELECT
+  mcn_group_sk,
+  mcn_group_name
+FROM mcn_with_sk

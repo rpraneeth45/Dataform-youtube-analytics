@@ -1,4 +1,3 @@
-
 config {
   type: "incremental",
   schema: "silver",
@@ -53,10 +52,10 @@ SELECT
   
   -- Channel Metadata
   item.snippet.country AS country,
-  PARSE_TIMESTAMP('%Y-%m-%dT%H:%M:%SZ', item.snippet.publishedAt) AS created_at,
+  item.snippet.publishedAt AS created_at,
   
-  -- Status
-  COALESCE(item.status.isLinked, TRUE) AS is_active,
+  -- Status (always active if data exists)
+  TRUE AS is_active,
   
   -- Statistics
   item.statistics.subscriberCount AS subscriber_count,

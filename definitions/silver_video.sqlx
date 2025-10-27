@@ -2,7 +2,7 @@ config {
   type: "incremental",
   schema: "silver",
   name: "silver_video",
-  description: "YouTube video metadata with derived SEO metrics",
+  description: "YouTube video metadata with engagement metrics and SEO scoring",
   tags: ["silver", "videos"],
   
   bigquery: {
@@ -12,121 +12,118 @@ config {
   },
   
   columns: {
-    video_id: "YouTube video ID",
-    channel_id: "YouTube channel ID (foreign key)",
+    video_id: "YouTube video ID (primary key with snapshot_date)",
+    channel_id: "Channel that published this video",
     title: "Video title",
     description: "Video description",
-    published_at: "Video publish timestamp",
+    published_at: "Video publication timestamp",
     duration_sec: "Video duration in seconds",
     category_id: "YouTube category ID",
     has_tags: "Whether video has tags",
     has_captions: "Whether video has captions",
     has_custom_thumbnail: "Whether video has custom thumbnail",
-    view_count: "Number of views",
-    like_count: "Number of likes",
-    comment_count: "Number of comments",
-    title_len: "Length of title (characters)",
-    description_len: "Length of description (characters)",
-    seo_score: "Calculated SEO score (0-100)",
+    view_count: "Total view count",
+    like_count: "Total like count",
+    comment_count: "Total comment count",
+    title_len: "Title length in characters",
+    description_len: "Description length in characters",
+    seo_score: "SEO score (0-100) based on metadata completeness",
     snapshot_date: "Date of data snapshot (partition key)"
   }
 }
 
 /*
- * Transform Bronze video data to Silver layer with derived metrics
+ * Transform Bronze video data to Silver layer
  * 
  * Source: control.bronze_videos_external (GCS external table)
  * Target: silver.silver_video (native BigQuery table)
  * 
  * Transformations:
- * - Parse nested JSON from YouTube API
  * - Extract video metadata and statistics
  * - Parse ISO 8601 duration to seconds
- * - Calculate derived fields (title_len, description_len, seo_score)
+ * - Calculate SEO score based on metadata completeness
  * - Clean and type-cast fields
  */
 
 SELECT
   -- Identifiers
-  JSON_EXTRACT_SCALAR(item, '$.id') AS video_id,
-  JSON_EXTRACT_SCALAR(bronze, '$.channel_id') AS channel_id,
+  item.id AS video_id,
+  item.snippet.channelId AS channel_id,
   
   -- Metadata
-  JSON_EXTRACT_SCALAR(item, '$.snippet.title') AS title,
-  JSON_EXTRACT_SCALAR(item, '$.snippet.description') AS description,
-  PARSE_TIMESTAMP('%Y-%m-%dT%H:%M:%SZ', JSON_EXTRACT_SCALAR(item, '$.snippet.publishedAt')) AS published_at,
+  item.snippet.title AS title,
+  item.snippet.description AS description,
+  item.snippet.publishedAt AS published_at,
   
-  -- Duration (parse ISO 8601 format PT1H2M30S to seconds)
-  (
-    COALESCE(CAST(REGEXP_EXTRACT(JSON_EXTRACT_SCALAR(item, '$.contentDetails.duration'), r'PT(\d+)H') AS INT64), 0) * 3600 +
-    COALESCE(CAST(REGEXP_EXTRACT(JSON_EXTRACT_SCALAR(item, '$.contentDetails.duration'), r'(\d+)M') AS INT64), 0) * 60 +
-    COALESCE(CAST(REGEXP_EXTRACT(JSON_EXTRACT_SCALAR(item, '$.contentDetails.duration'), r'(\d+)S') AS INT64), 0)
-  ) AS duration_sec,
+  -- Duration (convert ISO 8601 to seconds)
+  CAST(
+    COALESCE(CAST(REGEXP_EXTRACT(item.contentDetails.duration, r'PT(\d+)H') AS INT64), 0) * 3600 +
+    COALESCE(CAST(REGEXP_EXTRACT(item.contentDetails.duration, r'(\d+)M') AS INT64), 0) * 60 +
+    COALESCE(CAST(REGEXP_EXTRACT(item.contentDetails.duration, r'(\d+)S') AS INT64), 0)
+  AS INT64) AS duration_sec,
   
-  JSON_EXTRACT_SCALAR(item, '$.snippet.categoryId') AS category_id,
+  item.snippet.categoryId AS category_id,
   
-  -- Boolean Flags
+  -- Content Flags
   CASE 
-    WHEN JSON_EXTRACT_SCALAR(item, '$.snippet.tags') IS NOT NULL 
-    THEN TRUE 
+    WHEN ARRAY_LENGTH(item.snippet.tags) > 0 THEN TRUE 
     ELSE FALSE 
   END AS has_tags,
   
-  CAST(JSON_EXTRACT_SCALAR(item, '$.contentDetails.caption') AS BOOL) AS has_captions,
+  COALESCE(CAST(item.contentDetails.caption AS BOOL), FALSE) AS has_captions,
   
   CASE 
-    WHEN JSON_EXTRACT_SCALAR(item, '$.snippet.thumbnails.maxres.url') IS NOT NULL 
-    THEN TRUE 
+    WHEN item.snippet.thumbnails.maxres.url IS NOT NULL THEN TRUE 
     ELSE FALSE 
   END AS has_custom_thumbnail,
   
   -- Statistics
-  SAFE_CAST(JSON_EXTRACT_SCALAR(item, '$.statistics.viewCount') AS INT64) AS view_count,
-  SAFE_CAST(JSON_EXTRACT_SCALAR(item, '$.statistics.likeCount') AS INT64) AS like_count,
-  SAFE_CAST(JSON_EXTRACT_SCALAR(item, '$.statistics.commentCount') AS INT64) AS comment_count,
+  item.statistics.viewCount AS view_count,
+  item.statistics.likeCount AS like_count,
+  item.statistics.commentCount AS comment_count,
   
   -- Derived Fields
-  LENGTH(JSON_EXTRACT_SCALAR(item, '$.snippet.title')) AS title_len,
-  LENGTH(JSON_EXTRACT_SCALAR(item, '$.snippet.description')) AS description_len,
+  LENGTH(item.snippet.title) AS title_len,
+  LENGTH(item.snippet.description) AS description_len,
   
   -- SEO Score Calculation (0-100)
   LEAST(100.0,
     -- Title presence (20 points)
-    CASE WHEN JSON_EXTRACT_SCALAR(item, '$.snippet.title') IS NOT NULL 
-      AND LENGTH(JSON_EXTRACT_SCALAR(item, '$.snippet.title')) > 0 
+    CASE WHEN item.snippet.title IS NOT NULL 
+      AND LENGTH(item.snippet.title) > 0 
       THEN 20.0 ELSE 0.0 END +
     -- Description presence (20 points)
-    CASE WHEN JSON_EXTRACT_SCALAR(item, '$.snippet.description') IS NOT NULL 
-      AND LENGTH(JSON_EXTRACT_SCALAR(item, '$.snippet.description')) > 50 
+    CASE WHEN item.snippet.description IS NOT NULL 
+      AND LENGTH(item.snippet.description) > 50 
       THEN 20.0 ELSE 0.0 END +
     -- Optimal title length 40-70 chars (20 points)
-    CASE WHEN LENGTH(JSON_EXTRACT_SCALAR(item, '$.snippet.title')) BETWEEN 40 AND 70 
+    CASE WHEN LENGTH(item.snippet.title) BETWEEN 40 AND 70 
       THEN 20.0 ELSE 10.0 END +
     -- Has tags (20 points)
-    CASE WHEN JSON_EXTRACT_SCALAR(item, '$.snippet.tags') IS NOT NULL 
+    CASE WHEN ARRAY_LENGTH(item.snippet.tags) > 0 
       THEN 20.0 ELSE 0.0 END +
     -- Has custom thumbnail (20 points)
-    CASE WHEN JSON_EXTRACT_SCALAR(item, '$.snippet.thumbnails.maxres.url') IS NOT NULL 
+    CASE WHEN item.snippet.thumbnails.maxres.url IS NOT NULL 
       THEN 20.0 ELSE 0.0 END
   ) AS seo_score,
   
-  -- Partition Key
-  PARSE_DATE('%Y-%m-%d', JSON_EXTRACT_SCALAR(bronze, '$.snapshot_date')) AS snapshot_date
+  -- Partition Key (from Hive partition - already a DATE)
+  bronze.snapshot_date AS snapshot_date
 
 FROM 
   `tonal-transit-475913-a2.control.bronze_videos_external` AS bronze
-CROSS JOIN UNNEST(JSON_EXTRACT_ARRAY(bronze, '$.items')) AS item
+CROSS JOIN UNNEST(bronze.items) AS item
 
 WHERE
   -- Only process records with valid video IDs
-  JSON_EXTRACT_SCALAR(item, '$.id') IS NOT NULL
+  item.id IS NOT NULL
   
   -- Date filter: process specific date from DAG parameter
   ${ when(dataform.projectConfig.vars.target_date, 
-    `AND PARSE_DATE('%Y-%m-%d', JSON_EXTRACT_SCALAR(bronze, '$.snapshot_date')) = '${dataform.projectConfig.vars.target_date}'`
+    `AND bronze.snapshot_date = PARSE_DATE('%Y-%m-%d', '${dataform.projectConfig.vars.target_date}')`
   ) }
   
   -- Incremental filter: only reprocess recent partitions if no target_date specified
   ${ when(incremental() && !dataform.projectConfig.vars.target_date, 
-    `AND PARSE_DATE('%Y-%m-%d', JSON_EXTRACT_SCALAR(bronze, '$.snapshot_date')) >= DATE_SUB(CURRENT_DATE(), INTERVAL 7 DAY)`) }
+    `AND bronze.snapshot_date >= DATE_SUB(CURRENT_DATE(), INTERVAL 7 DAY)`) }
 

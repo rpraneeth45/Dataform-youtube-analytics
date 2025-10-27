@@ -50,7 +50,7 @@ SELECT
   ) }
 
 FROM 
-  ${ref("control", "mcn_registry")}
+  `tonal-transit-475913-a2.control.mcn_registry`
 
 WHERE
   -- Only include active MCNs

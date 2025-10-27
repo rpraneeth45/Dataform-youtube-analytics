@@ -1,0 +1,178 @@
+config {
+  type: "incremental",
+  schema: "gold",
+  name: "dim_video",
+  description: "Video dimension with SCD2 and SEO attributes",
+  tags: ["gold", "dimension", "video", "scd2", "seo"],
+  
+  bigquery: {
+    clusterBy: ["channel_sk", "length_bucket"]
+  }
+}
+
+/*
+ * Video dimension with SCD2 implementation
+ * Tracks historical changes to video attributes
+ * Includes SEO metrics and length categorization
+ */
+
+WITH video_data AS (
+  SELECT
+    video_id,
+    channel_id,
+    title,
+    description,
+    published_at,
+    duration_sec,
+    has_tags,
+    has_custom_thumbnail,
+    has_captions,
+    title_len,
+    description_len,
+    seo_score,
+    snapshot_date
+  FROM ${ref("silver", "silver_video")}
+  WHERE video_id IS NOT NULL
+),
+
+channel_lookup AS (
+  SELECT
+    channel_sk,
+    channel_id,
+    is_current
+  FROM ${ref("gold", "dim_channel")}
+  WHERE is_current = TRUE
+),
+
+video_with_channel AS (
+  SELECT
+    v.video_id,
+    c.channel_sk,
+    v.title,
+    v.description,
+    v.published_at,
+    v.duration_sec,
+    v.has_tags,
+    v.has_custom_thumbnail,
+    v.has_captions,
+    v.title_len,
+    v.description_len,
+    v.seo_score,
+    v.snapshot_date
+  FROM video_data v
+  LEFT JOIN channel_lookup c ON v.channel_id = c.channel_id
+),
+
+-- Add length bucket categorization
+video_with_buckets AS (
+  SELECT
+    *,
+    CASE 
+      WHEN duration_sec < 60 THEN 'Short'
+      WHEN duration_sec < 300 THEN 'Mid'  -- 5 minutes
+      ELSE 'Long'
+    END AS length_bucket
+  FROM video_with_channel
+),
+
+-- SCD2 Logic: Detect changes and create effective date ranges
+video_changes AS (
+  SELECT
+    video_id,
+    channel_sk,
+    title,
+    description,
+    published_at,
+    duration_sec,
+    has_tags,
+    has_custom_thumbnail,
+    has_captions,
+    title_len,
+    description_len,
+    seo_score,
+    length_bucket,
+    snapshot_date,
+    
+    -- Detect changes
+    LAG(title) OVER (
+      PARTITION BY video_id 
+      ORDER BY snapshot_date
+    ) AS prev_title,
+    
+    LAG(seo_score) OVER (
+      PARTITION BY video_id 
+      ORDER BY snapshot_date
+    ) AS prev_seo_score,
+    
+    -- Row number for surrogate key
+    ROW_NUMBER() OVER (
+      PARTITION BY video_id 
+      ORDER BY snapshot_date
+    ) AS row_num
+  FROM video_with_buckets
+),
+
+scd2_records AS (
+  SELECT
+    video_id,
+    channel_sk,
+    title,
+    description,
+    published_at,
+    duration_sec,
+    has_tags,
+    has_custom_thumbnail,
+    has_captions,
+    title_len,
+    description_len,
+    seo_score,
+    length_bucket,
+    snapshot_date,
+    
+    -- Create surrogate key
+    ROW_NUMBER() OVER (ORDER BY video_id, snapshot_date) AS video_sk,
+    
+    -- SCD2 effective dates
+    snapshot_date AS effective_start_date,
+    LEAD(snapshot_date) OVER (
+      PARTITION BY video_id 
+      ORDER BY snapshot_date
+    ) AS effective_end_date,
+    
+    -- Current record flag
+    CASE 
+      WHEN LEAD(snapshot_date) OVER (
+        PARTITION BY video_id 
+        ORDER BY snapshot_date
+      ) IS NULL THEN TRUE 
+      ELSE FALSE 
+    END AS is_current
+    
+  FROM video_changes
+  WHERE 
+    -- Only include records where something changed
+    (title != prev_title OR prev_title IS NULL)
+    OR (seo_score != prev_seo_score OR prev_seo_score IS NULL)
+    OR row_num = 1  -- Always include first record
+)
+
+SELECT
+  video_sk,
+  video_id,
+  channel_sk,
+  title,
+  description,
+  published_at,
+  duration_sec,
+  has_tags,
+  has_custom_thumbnail,
+  has_captions,
+  title_len,
+  description_len,
+  seo_score,
+  length_bucket,
+  TIMESTAMP(snapshot_date) AS created_at,
+  effective_start_date,
+  effective_end_date,
+  is_current
+FROM scd2_records

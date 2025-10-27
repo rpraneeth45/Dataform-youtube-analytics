@@ -1,0 +1,71 @@
+config {
+  type: "view",
+  schema: "reporting",
+  name: "v_video_performance",
+  description: "Video performance snapshot view",
+  tags: ["reporting", "video", "performance", "analytics"]
+}
+
+/*
+ * Video Performance View
+ * 
+ * Purpose: Exposes latest per-video KPIs and lightweight rolling aggregates used by 
+ * video-level and channel-level dashboards.
+ * 
+ * Business Logic:
+ * - Gets latest snapshot per video
+ * - Includes SEO and metadata attributes
+ * - Calculates engagement proxy and rolling 7-day metrics
+ * - Provides comprehensive video performance data
+ */
+
+WITH latest_video_snapshot AS (
+  -- latest snapshot per video (most recent date_key)
+  SELECT
+    video_sk,
+    MAX(date_key) AS latest_date_key
+  FROM ${ref("gold", "f_video_daily_snapshot")}
+  GROUP BY video_sk
+)
+
+SELECT
+  -- video identifiers
+  dv.video_id,                                 -- YouTube video id (string)
+  dv.channel_sk,                               -- FK to dim_channel
+  c.channel_title,                              -- Channel human-readable title
+  dv.title AS video_title,                      -- Video title
+  dv.published_at AS video_published_at,        -- Published timestamp
+  -- video metadata
+  dv.length_bucket,                             -- Length bucket/category (smallint/string)
+  dv.seo_score,                                 -- SEO / metadata quality score
+  dv.has_tags,                                  -- Boolean: has tags
+  dv.has_custom_thumbnail,                      -- Boolean: has custom thumbnail
+  dv.has_captions,                              -- Boolean: has captions
+  dv.title_len,                                 -- Title length (chars)
+  dv.description_len,                           -- Description length (chars)
+  -- latest snapshot KPIs
+  fv.view_count_total AS views_latest,          -- Latest total views
+  fv.like_count_total AS likes_latest,          -- Latest total likes
+  fv.comment_count_total AS comments_latest,    -- Latest total comments
+  fv.view_delta AS views_delta_latest,          -- Delta in views on the latest snapshot
+  fv.like_delta AS likes_delta_latest,          -- Delta in likes on the latest snapshot
+  fv.comment_delta AS comments_delta_latest,    -- Delta in comments on the latest snapshot
+  -- derived metrics
+  SAFE_DIVIDE(fv.like_count_total + fv.comment_count_total, NULLIF(fv.view_count_total,0)) AS engagement_proxy_latest, -- Simple engagement proxy
+  -- precomputed rolling 7-day view delta
+  COALESCE(rolling_7d.views_7d, 0) AS views_last_7d,
+  fv.date_key AS latest_snapshot_date_key
+FROM ${ref("gold", "dim_video")} dv
+LEFT JOIN ${ref("gold", "dim_channel")} c ON dv.channel_sk = c.channel_sk
+LEFT JOIN latest_video_snapshot lvs ON dv.video_sk = lvs.video_sk
+LEFT JOIN ${ref("gold", "f_video_daily_snapshot")} fv
+  ON dv.video_sk = fv.video_sk AND fv.date_key = lvs.latest_date_key
+LEFT JOIN (
+  SELECT
+    fv2.video_sk,
+    SUM(IFNULL(fv2.view_delta,0)) AS views_7d
+  FROM ${ref("gold", "f_video_daily_snapshot")} fv2
+  WHERE fv2.date_key BETWEEN CAST(FORMAT_DATE('%Y%m%d', DATE_SUB(CURRENT_DATE(), INTERVAL 7 DAY)) AS INT64)
+                       AND CAST(FORMAT_DATE('%Y%m%d', DATE_SUB(CURRENT_DATE(), INTERVAL 1 DAY)) AS INT64)
+  GROUP BY fv2.video_sk
+) rolling_7d ON rolling_7d.video_sk = dv.video_sk

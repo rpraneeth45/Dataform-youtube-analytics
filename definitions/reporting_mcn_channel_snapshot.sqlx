@@ -1,0 +1,47 @@
+config {
+  type: "view",
+  schema: "reporting",
+  name: "mcn_channel_snapshot",
+  description: "MCN channel snapshot (latest)",
+  tags: ["reporting", "mcn", "channels"]
+}
+
+/*
+ * MCN Channel Snapshot View
+ * 
+ * Purpose: Returns the most recent channel snapshot per channel with channel and MCN metadata.
+ * Useful for MCN dashboards and leaderboards.
+ * 
+ * Business Logic:
+ * - Gets latest snapshot per channel using ROW_NUMBER()
+ * - Joins with channel and MCN dimension tables
+ * - Provides current channel metrics with metadata
+ */
+
+WITH latest_snapshot AS (
+  SELECT
+    channel_sk,
+    date_key,
+    subscriber_count,
+    view_count_total,
+    video_count_total,
+    ROW_NUMBER() OVER (PARTITION BY channel_sk ORDER BY date_key DESC) AS rn
+  FROM ${ref("gold", "f_channel_daily_snapshot")}
+)
+
+SELECT
+  ls.channel_sk,
+  ls.date_key AS snapshot_date_key,
+  DATE(PARSE_DATE('%Y%m%d', CAST(ls.date_key AS STRING))) AS snapshot_date,
+  ls.subscriber_count,
+  ls.view_count_total,
+  ls.video_count_total,
+  ch.channel_id,
+  ch.channel_title,
+  mg.mcn_group_sk,
+  mg.mcn_group_name
+FROM (SELECT * FROM latest_snapshot WHERE rn = 1) ls
+LEFT JOIN ${ref("gold", "dim_channel")} ch
+  ON ls.channel_sk = ch.channel_sk
+LEFT JOIN ${ref("gold", "dim_mcn_group")} mg
+  ON ch.mcn_group_sk = mg.mcn_group_sk

@@ -1,0 +1,121 @@
+config {
+  type: "incremental",
+  schema: "gold",
+  name: "dim_channel",
+  description: "Channel dimension with SCD2 (Slowly Changing Dimension Type 2)",
+  tags: ["gold", "dimension", "channel", "scd2"],
+  
+  bigquery: {
+    clusterBy: ["mcn_group_sk"]
+  }
+}
+
+/*
+ * Channel dimension with SCD2 implementation
+ * Tracks historical changes to channel attributes
+ * Links to MCN groups for analytics
+ */
+
+WITH channel_data AS (
+  SELECT
+    channel_id,
+    channel_title,
+    mcn_group_id,
+    created_at,
+    snapshot_date
+  FROM ${ref("silver", "silver_channel")}
+  WHERE channel_id IS NOT NULL
+),
+
+mcn_lookup AS (
+  SELECT
+    g.mcn_group_sk,
+    s.mcn_group_id
+  FROM ${ref("gold", "dim_mcn_group")} g
+  JOIN ${ref("silver", "silver_mcn_group")} s ON g.mcn_group_name = s.mcn_group_name
+),
+
+channel_with_mcn AS (
+  SELECT
+    c.channel_id,
+    c.channel_title,
+    m.mcn_group_sk,
+    c.created_at,
+    c.snapshot_date
+  FROM channel_data c
+  LEFT JOIN mcn_lookup m ON c.mcn_group_id = m.mcn_group_id
+),
+
+-- SCD2 Logic: Detect changes and create effective date ranges
+channel_changes AS (
+  SELECT
+    channel_id,
+    channel_title,
+    mcn_group_sk,
+    created_at,
+    snapshot_date,
+    
+    -- Detect changes
+    LAG(channel_title) OVER (
+      PARTITION BY channel_id 
+      ORDER BY snapshot_date
+    ) AS prev_channel_title,
+    
+    LAG(mcn_group_sk) OVER (
+      PARTITION BY channel_id 
+      ORDER BY snapshot_date
+    ) AS prev_mcn_group_sk,
+    
+    -- Row number for surrogate key
+    ROW_NUMBER() OVER (
+      PARTITION BY channel_id 
+      ORDER BY snapshot_date
+    ) AS row_num
+  FROM channel_with_mcn
+),
+
+scd2_records AS (
+  SELECT
+    channel_id,
+    channel_title,
+    mcn_group_sk,
+    created_at,
+    snapshot_date,
+    
+    -- Create surrogate key
+    ROW_NUMBER() OVER (ORDER BY channel_id, snapshot_date) AS channel_sk,
+    
+    -- SCD2 effective dates
+    snapshot_date AS effective_start_date,
+    LEAD(snapshot_date) OVER (
+      PARTITION BY channel_id 
+      ORDER BY snapshot_date
+    ) AS effective_end_date,
+    
+    -- Current record flag
+    CASE 
+      WHEN LEAD(snapshot_date) OVER (
+        PARTITION BY channel_id 
+        ORDER BY snapshot_date
+      ) IS NULL THEN TRUE 
+      ELSE FALSE 
+    END AS is_current
+    
+  FROM channel_changes
+  WHERE 
+    -- Only include records where something changed
+    (channel_title != prev_channel_title OR prev_channel_title IS NULL)
+    OR (mcn_group_sk != prev_mcn_group_sk OR prev_mcn_group_sk IS NULL)
+    OR row_num = 1  -- Always include first record
+)
+
+SELECT
+  channel_sk,
+  channel_id,
+  channel_title,
+  mcn_group_sk,
+  created_at,
+  effective_start_date,
+  effective_end_date,
+  is_current
+FROM scd2_records

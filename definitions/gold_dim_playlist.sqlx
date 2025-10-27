@@ -1,0 +1,98 @@
+config {
+  type: "incremental",
+  schema: "gold",
+  name: "dim_playlist",
+  description: "Playlist dimension with SCD2",
+  tags: ["gold", "dimension", "playlist", "scd2"]
+}
+
+/*
+ * Playlist dimension with SCD2 implementation
+ * Tracks historical changes to playlist attributes
+ */
+
+WITH playlist_data AS (
+  SELECT
+    playlist_id,
+    title,
+    item_count,
+    published_at,
+    snapshot_date
+  FROM ${ref("silver", "silver_playlist")}
+  WHERE playlist_id IS NOT NULL
+),
+
+-- SCD2 Logic: Detect changes and create effective date ranges
+playlist_changes AS (
+  SELECT
+    playlist_id,
+    title,
+    item_count,
+    published_at,
+    snapshot_date,
+    
+    -- Detect changes
+    LAG(title) OVER (
+      PARTITION BY playlist_id 
+      ORDER BY snapshot_date
+    ) AS prev_title,
+    
+    LAG(item_count) OVER (
+      PARTITION BY playlist_id 
+      ORDER BY snapshot_date
+    ) AS prev_item_count,
+    
+    -- Row number for surrogate key
+    ROW_NUMBER() OVER (
+      PARTITION BY playlist_id 
+      ORDER BY snapshot_date
+    ) AS row_num
+  FROM playlist_data
+),
+
+scd2_records AS (
+  SELECT
+    playlist_id,
+    title,
+    item_count,
+    published_at,
+    snapshot_date,
+    
+    -- Create surrogate key
+    ROW_NUMBER() OVER (ORDER BY playlist_id, snapshot_date) AS playlist_sk,
+    
+    -- SCD2 effective dates
+    snapshot_date AS effective_start_date,
+    LEAD(snapshot_date) OVER (
+      PARTITION BY playlist_id 
+      ORDER BY snapshot_date
+    ) AS effective_end_date,
+    
+    -- Current record flag
+    CASE 
+      WHEN LEAD(snapshot_date) OVER (
+        PARTITION BY playlist_id 
+        ORDER BY snapshot_date
+      ) IS NULL THEN TRUE 
+      ELSE FALSE 
+    END AS is_current
+    
+  FROM playlist_changes
+  WHERE 
+    -- Only include records where something changed
+    (title != prev_title OR prev_title IS NULL)
+    OR (item_count != prev_item_count OR prev_item_count IS NULL)
+    OR row_num = 1  -- Always include first record
+)
+
+SELECT
+  playlist_sk,
+  playlist_id,
+  title AS playlist_title,
+  item_count AS playlist_item_count,
+  published_at,
+  TIMESTAMP(snapshot_date) AS created_at,
+  effective_start_date,
+  effective_end_date,
+  is_current
+FROM scd2_records

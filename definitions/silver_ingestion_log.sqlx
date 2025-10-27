@@ -51,17 +51,14 @@ WITH ranked_runs AS (
       ORDER BY run_id DESC
     ) AS rn
   
-  FROM ${ref("control", "ingestion_run_channels")}
+  FROM `tonal-transit-475913-a2.control.ingestion_run_channels`
   
   WHERE
+    1=1
     -- Date filter: process specific date from DAG parameter
     ${ when(dataform.projectConfig.vars.target_date, 
-      `run_date = '${dataform.projectConfig.vars.target_date}'`
+      `AND run_date = '${dataform.projectConfig.vars.target_date}'`
     ) }
-    
-    -- Incremental filter if no target_date specified
-    ${ when(incremental() && !dataform.projectConfig.vars.target_date, 
-      `run_date >= DATE_SUB(CURRENT_DATE(), INTERVAL 7 DAY)`) }
 )
 
 SELECT

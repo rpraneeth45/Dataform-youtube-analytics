@@ -20,34 +20,39 @@ config {
   }
 }
 
+/*
+ * Transform Bronze playlist items to Silver layer
+ * 
+ * Source: control.bronze_playlist_items_external (GCS external table)
+ * Target: silver.silver_playlist_video (native BigQuery table)
+ * 
+ * Transformations:
+ * - Extract playlist-video relationships
+ * - Track position in playlist
+ * - Mark current snapshot (most recent for each playlist-video pair)
+ */
 
 WITH playlist_items AS (
   SELECT
-    JSON_EXTRACT_SCALAR(bronze, '$.playlist_id') AS playlist_id,
-    JSON_EXTRACT_SCALAR(item, '$.contentDetails.videoId') AS video_id,
-    
-    SAFE_CAST(JSON_EXTRACT_SCALAR(item, '$.snippet.position') AS INT64) AS position,
-    
-    -- Partition Key
-    PARSE_DATE('%Y-%m-%d', JSON_EXTRACT_SCALAR(bronze, '$.snapshot_date')) AS snapshot_date
-  
+    bronze.playlist_id AS playlist_id,
+    item.contentDetails.videoId AS video_id,
+    item.snippet.position AS position,
+    bronze.snapshot_date AS snapshot_date
   FROM 
     `tonal-transit-475913-a2.control.bronze_playlist_items_external` AS bronze
-  CROSS JOIN UNNEST(JSON_EXTRACT_ARRAY(bronze, '$.items')) AS item
-  
+  CROSS JOIN UNNEST(bronze.items) AS item
   WHERE
-    -- Only process records with valid IDs
-    JSON_EXTRACT_SCALAR(bronze, '$.playlist_id') IS NOT NULL
-    AND JSON_EXTRACT_SCALAR(item, '$.contentDetails.videoId') IS NOT NULL
+    bronze.playlist_id IS NOT NULL
+    AND item.contentDetails.videoId IS NOT NULL
     
     -- Date filter: process specific date from DAG parameter
     ${ when(dataform.projectConfig.vars.target_date, 
-      `AND PARSE_DATE('%Y-%m-%d', JSON_EXTRACT_SCALAR(bronze, '$.snapshot_date')) = '${dataform.projectConfig.vars.target_date}'`
+      `AND bronze.snapshot_date = PARSE_DATE('%Y-%m-%d', '${dataform.projectConfig.vars.target_date}')`
     ) }
     
     -- Incremental filter if no target_date specified
     ${ when(incremental() && !dataform.projectConfig.vars.target_date, 
-      `AND PARSE_DATE('%Y-%m-%d', JSON_EXTRACT_SCALAR(bronze, '$.snapshot_date')) >= DATE_SUB(CURRENT_DATE(), INTERVAL 7 DAY)`) }
+      `AND bronze.snapshot_date >= DATE_SUB(CURRENT_DATE(), INTERVAL 7 DAY)`) }
 ),
 
 latest_snapshots AS (
@@ -63,15 +68,11 @@ SELECT
   pi.playlist_id,
   pi.video_id,
   pi.position,
-  
-  -- Mark as current if this is the latest snapshot for this playlist-video pair
   CASE 
     WHEN pi.snapshot_date = ls.latest_snapshot_date THEN TRUE 
     ELSE FALSE 
   END AS is_current,
-  
   pi.snapshot_date
-
 FROM playlist_items pi
 LEFT JOIN latest_snapshots ls
   ON pi.playlist_id = ls.playlist_id

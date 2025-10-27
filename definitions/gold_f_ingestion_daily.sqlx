@@ -1,0 +1,54 @@
+config {
+  type: "incremental",
+  schema: "gold",
+  name: "f_ingestion_daily",
+  description: "Ingestion pipeline health per channel/day",
+  tags: ["gold", "fact", "ingestion", "monitoring"],
+  
+  bigquery: {
+    clusterBy: ["date_key", "channel_sk"]
+  }
+}
+
+/*
+ * Ingestion daily fact table
+ * Tracks pipeline health and data quality per channel
+ */
+
+WITH ingestion_data AS (
+  SELECT
+    channel_id,
+    last_ingest_at,
+    error_flag,
+    snapshot_date
+  FROM ${ref("silver", "silver_ingestion_log")}
+  WHERE channel_id IS NOT NULL
+),
+
+channel_lookup AS (
+  SELECT
+    channel_sk,
+    channel_id,
+    is_current
+  FROM ${ref("gold", "dim_channel")}
+  WHERE is_current = TRUE
+),
+
+ingestion_with_sk AS (
+  SELECT
+    i.channel_id,
+    i.last_ingest_at,
+    i.error_flag,
+    i.snapshot_date,
+    cl.channel_sk
+  FROM ingestion_data i
+  LEFT JOIN channel_lookup cl ON i.channel_id = cl.channel_id
+  WHERE cl.channel_sk IS NOT NULL
+)
+
+SELECT
+  CAST(FORMAT_DATE('%Y%m%d', snapshot_date) AS INT64) AS date_key,
+  channel_sk,
+  last_ingest_at,
+  error_flag
+FROM ingestion_with_sk

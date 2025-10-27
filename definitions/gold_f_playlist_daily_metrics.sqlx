@@ -1,0 +1,116 @@
+config {
+  type: "incremental",
+  schema: "gold",
+  name: "f_playlist_daily_metrics",
+  description: "Playlist daily metrics (rolled up from videos)",
+  tags: ["gold", "fact", "playlist", "metrics"],
+  
+  bigquery: {
+    clusterBy: ["date_key", "playlist_sk"]
+  }
+}
+
+/*
+ * Playlist daily metrics fact table
+ * Aggregates video metrics at playlist level for analytics
+ */
+
+WITH playlist_video_data AS (
+  SELECT
+    pv.playlist_id,
+    pv.video_id,
+    pv.snapshot_date
+  FROM ${ref("silver", "silver_playlist_video")} pv
+  WHERE pv.playlist_id IS NOT NULL 
+    AND pv.video_id IS NOT NULL
+    AND pv.is_current = TRUE
+),
+
+video_metrics AS (
+  SELECT
+    video_id,
+    view_count,
+    like_count,
+    comment_count,
+    snapshot_date
+  FROM ${ref("silver", "silver_video")}
+  WHERE video_id IS NOT NULL
+),
+
+playlist_lookup AS (
+  SELECT
+    playlist_sk,
+    playlist_id,
+    is_current
+  FROM ${ref("gold", "dim_playlist")}
+  WHERE is_current = TRUE
+),
+
+-- Join playlist videos with their metrics
+playlist_video_metrics AS (
+  SELECT
+    pv.playlist_id,
+    pv.video_id,
+    pv.snapshot_date,
+    vm.view_count,
+    vm.like_count,
+    vm.comment_count,
+    pl.playlist_sk
+  FROM playlist_video_data pv
+  LEFT JOIN video_metrics vm ON pv.video_id = vm.video_id 
+    AND pv.snapshot_date = vm.snapshot_date
+  LEFT JOIN playlist_lookup pl ON pv.playlist_id = pl.playlist_id
+  WHERE pl.playlist_sk IS NOT NULL
+),
+
+-- Calculate deltas for each video in playlist
+playlist_video_deltas AS (
+  SELECT
+    playlist_sk,
+    playlist_id,
+    video_id,
+    snapshot_date,
+    view_count,
+    like_count,
+    comment_count,
+    
+    -- Calculate deltas
+    view_count - LAG(view_count) OVER (
+      PARTITION BY playlist_sk, video_id 
+      ORDER BY snapshot_date
+    ) AS view_delta,
+    
+    like_count - LAG(like_count) OVER (
+      PARTITION BY playlist_sk, video_id 
+      ORDER BY snapshot_date
+    ) AS like_delta,
+    
+    comment_count - LAG(comment_count) OVER (
+      PARTITION BY playlist_sk, video_id 
+      ORDER BY snapshot_date
+    ) AS comment_delta
+    
+  FROM playlist_video_metrics
+),
+
+-- Aggregate to playlist level
+playlist_daily_metrics AS (
+  SELECT
+    playlist_sk,
+    snapshot_date,
+    COUNT(DISTINCT video_id) AS video_count,
+    SUM(COALESCE(view_delta, 0)) AS view_delta,
+    SUM(COALESCE(like_delta, 0)) AS like_delta,
+    SUM(COALESCE(comment_delta, 0)) AS comment_delta
+  FROM playlist_video_deltas
+  GROUP BY playlist_sk, snapshot_date
+)
+
+SELECT
+  CAST(FORMAT_DATE('%Y%m%d', snapshot_date) AS INT64) AS date_key,
+  playlist_sk,
+  view_delta,
+  like_delta,
+  comment_delta,
+  video_count
+FROM playlist_daily_metrics

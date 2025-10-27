@@ -1,0 +1,33 @@
+config {
+  type: "view",
+  schema: "reporting",
+  name: "v_channel_trends_daily",
+  description: "Channel daily trends (project-qualified variant)",
+  tags: ["reporting", "channel", "trends", "timeseries"]
+}
+
+/*
+ * Channel Daily Trends View
+ * 
+ * Purpose: Lightweight per-channel timeseries view (project-qualified) provided by user.
+ * 
+ * Business Logic:
+ * - Provides daily channel metrics over time
+ * - Includes view counts, subscribers, and deltas
+ * - Filters to current channel records only
+ * - Enables time-series analysis for channels
+ */
+
+SELECT
+  s.date_key,
+  d.full_date,
+  s.channel_sk,
+  c.channel_title,
+  s.view_count_total,
+  s.subscriber_count,
+  s.view_delta,
+  s.subscriber_delta
+FROM ${ref("gold", "f_channel_daily_snapshot")} s
+JOIN ${ref("gold", "dim_channel")} c ON s.channel_sk = c.channel_sk
+LEFT JOIN ${ref("gold", "dim_date")} d ON s.date_key = d.date_key
+WHERE c.is_current = TRUE

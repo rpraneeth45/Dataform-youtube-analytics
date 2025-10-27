@@ -1,0 +1,48 @@
+config {
+  type: "view",
+  schema: "reporting",
+  name: "v_playlist_performance",
+  description: "Playlist performance reporting view",
+  tags: ["reporting", "playlist", "performance", "analytics"]
+}
+
+/*
+ * Playlist Performance View
+ * 
+ * Purpose: Playlist-level performance reporting view (channel overview dashboard).
+ * Uses latest per-video snapshot (latest date_key) so playlist averages reflect most recent counts.
+ * 
+ * Business Logic:
+ * - Gets latest snapshot per video
+ * - Aggregates video metrics to playlist level
+ * - Calculates average views per video in playlist
+ * - Provides playlist performance metrics
+ */
+
+WITH latest_snapshot AS (
+  SELECT
+    video_sk,
+    MAX(date_key) AS latest_date_key
+  FROM ${ref("gold", "f_video_daily_snapshot")}
+  GROUP BY video_sk
+),
+video_latest AS (
+  SELECT
+    f.video_sk,
+    f.view_count_total AS views_total_latest
+  FROM ${ref("gold", "f_video_daily_snapshot")} f
+  JOIN latest_snapshot l
+    ON f.video_sk = l.video_sk AND f.date_key = l.latest_date_key
+)
+
+SELECT
+  p.playlist_title,                        -- Playlist title
+  COUNT(DISTINCT bpv.video_sk) AS items,   -- Number of videos in playlist (current bridge rows)
+  AVG(v.views_total_latest) AS avg_views_per_item -- Average of latest views per video in playlist
+FROM ${ref("gold", "dim_playlist")} p
+JOIN ${ref("gold", "bridge_playlist_video")} bpv
+  ON p.playlist_sk = bpv.playlist_sk
+JOIN video_latest v
+  ON bpv.video_sk = v.video_sk
+WHERE p.is_current = TRUE
+GROUP BY p.playlist_title

@@ -1,0 +1,88 @@
+config {
+  type: "incremental",
+  schema: "gold",
+  name: "f_channel_daily_snapshot",
+  description: "Channel daily snapshot with cumulative metrics and deltas",
+  tags: ["gold", "fact", "channel", "snapshot"],
+  
+  bigquery: {
+    clusterBy: ["date_key", "channel_sk"]
+  }
+}
+
+/*
+ * Channel daily snapshot fact table
+ * Provides cumulative metrics and calculated deltas for channel performance
+ */
+
+WITH channel_data AS (
+  SELECT
+    channel_id,
+    subscriber_count,
+    view_count_total,
+    video_count_total,
+    snapshot_date
+  FROM ${ref("silver", "silver_channel")}
+  WHERE channel_id IS NOT NULL
+),
+
+channel_lookup AS (
+  SELECT
+    channel_sk,
+    channel_id,
+    is_current
+  FROM ${ref("gold", "dim_channel")}
+  WHERE is_current = TRUE
+),
+
+channel_with_sk AS (
+  SELECT
+    c.channel_id,
+    c.subscriber_count,
+    c.view_count_total,
+    c.video_count_total,
+    c.snapshot_date,
+    cl.channel_sk
+  FROM channel_data c
+  LEFT JOIN channel_lookup cl ON c.channel_id = cl.channel_id
+  WHERE cl.channel_sk IS NOT NULL
+),
+
+-- Calculate deltas by comparing with previous day
+channel_with_deltas AS (
+  SELECT
+    channel_sk,
+    snapshot_date,
+    subscriber_count,
+    view_count_total,
+    video_count_total,
+    
+    -- Calculate deltas
+    subscriber_count - LAG(subscriber_count) OVER (
+      PARTITION BY channel_sk 
+      ORDER BY snapshot_date
+    ) AS subscriber_delta,
+    
+    view_count_total - LAG(view_count_total) OVER (
+      PARTITION BY channel_sk 
+      ORDER BY snapshot_date
+    ) AS view_delta,
+    
+    video_count_total - LAG(video_count_total) OVER (
+      PARTITION BY channel_sk 
+      ORDER BY snapshot_date
+    ) AS video_count_delta
+    
+  FROM channel_with_sk
+)
+
+SELECT
+  CAST(FORMAT_DATE('%Y%m%d', snapshot_date) AS INT64) AS date_key,
+  channel_sk,
+  subscriber_count,
+  view_count_total,
+  video_count_total,
+  COALESCE(subscriber_delta, 0) AS subscriber_delta,
+  COALESCE(view_delta, 0) AS view_delta,
+  COALESCE(video_count_delta, 0) AS video_count_delta
+FROM channel_with_deltas

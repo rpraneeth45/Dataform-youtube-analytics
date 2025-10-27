@@ -1,0 +1,98 @@
+config {
+  type: "view",
+  schema: "reporting",
+  name: "v_seo_top_offenders",
+  description: "Videos with low SEO scores and missing elements",
+  tags: ["reporting", "seo", "offenders", "table", "analytics"]
+}
+
+/*
+ * SEO Top Offenders View
+ * 
+ * Purpose: Provides a detailed table of videos with poor SEO scores, showing
+ * what elements are missing and their performance metrics for improvement prioritization.
+ * 
+ * Business Logic:
+ * - Identifies videos with SEO scores below 50 (configurable threshold)
+ * - Creates comma-separated list of missing SEO elements
+ * - Includes latest view counts and publication dates
+ * - Orders by SEO score (ascending) and views (descending)
+ * - Limits to top 100 offenders for performance
+ * 
+ * Columns:
+ *   video_id             : YouTube video id
+ *   video_title          : Video title
+ *   channel_sk           : surrogate key for the channel
+ *   channel_id           : YouTube channel id
+ *   channel_title        : Channel title
+ *   seo_score            : SEO score (0-100)
+ *   missing_elements     : comma-separated list of missing SEO elements
+ *   views_latest         : latest view count
+ *   published_date       : video publication date
+ *   length_bucket        : video length category
+ *   title_len            : title length in characters
+ *   description_len      : description length in characters
+ */
+
+WITH video_metrics AS (
+  SELECT
+    dv.video_sk,
+    dv.video_id,
+    dv.video_title,
+    dv.channel_sk,
+    c.channel_id,
+    c.channel_title,
+    dv.seo_score,
+    dv.has_tags,
+    dv.has_custom_thumbnail,
+    dv.has_captions,
+    dv.title_len,
+    dv.description_len,
+    dv.length_bucket,
+    dv.video_published_at,
+    -- Get latest view count for the video
+    fv.view_count_total AS views_latest
+  FROM ${ref("gold", "dim_video")} dv
+  LEFT JOIN ${ref("gold", "dim_channel")} c 
+    ON dv.channel_sk = c.channel_sk
+  LEFT JOIN (
+    -- Get latest snapshot for each video
+    SELECT 
+      video_sk,
+      view_count_total,
+      ROW_NUMBER() OVER (PARTITION BY video_sk ORDER BY date_key DESC) as rn
+    FROM ${ref("gold", "f_video_daily_snapshot")}
+  ) fv ON dv.video_sk = fv.video_sk AND fv.rn = 1
+  WHERE dv.is_current = TRUE
+    AND c.is_current = TRUE
+    -- Filter for videos published in the last 90 days (configurable)
+    AND dv.video_published_at >= TIMESTAMP_SUB(CURRENT_TIMESTAMP(), INTERVAL 90 DAY)
+    -- Only include videos with low SEO scores (configurable threshold)
+    AND dv.seo_score < 50
+)
+
+SELECT
+  video_id,
+  video_title,
+  channel_sk,
+  channel_id,
+  channel_title,
+  seo_score,
+  -- Create comma-separated list of missing elements
+  CONCAT(
+    CASE WHEN NOT has_tags THEN 'tags' ELSE NULL END,
+    CASE WHEN NOT has_custom_thumbnail THEN 
+      CASE WHEN NOT has_tags THEN ', thumbnail' ELSE 'thumbnail' END 
+    ELSE NULL END,
+    CASE WHEN NOT has_captions THEN 
+      CASE WHEN NOT has_tags OR NOT has_custom_thumbnail THEN ', captions' ELSE 'captions' END 
+    ELSE NULL END
+  ) AS missing_elements,
+  COALESCE(views_latest, 0) AS views_latest,
+  DATE(video_published_at) AS published_date,
+  length_bucket,
+  title_len,
+  description_len
+FROM video_metrics
+ORDER BY seo_score ASC, views_latest DESC
+LIMIT 100 -- Limit to top 100 offenders for performance

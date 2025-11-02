@@ -1,0 +1,27 @@
+config {
+  type: "assertion",
+  name: "assert_silver_channel_no_duplicates",
+  description: "Ensure no duplicate channel_id per snapshot_date in silver_channel",
+  tags: ["quality", "silver", "channels"]
+}
+
+/*
+ * Data Quality Check: No Duplicates
+ * 
+ * This assertion fails if any channel_id appears more than once
+ * for the same snapshot_date in the silver_channel table.
+ */
+
+SELECT 
+  snapshot_date,
+  channel_id,
+  COUNT(*) as duplicate_count
+FROM ${ref("silver_channel")}
+${ when(dataform.projectConfig.vars.target_date, 
+  `WHERE snapshot_date = '${dataform.projectConfig.vars.target_date}'`
+) }
+GROUP BY snapshot_date, channel_id
+HAVING COUNT(*) > 1;
+
+-- If this query returns any rows, the assertion FAILS
+

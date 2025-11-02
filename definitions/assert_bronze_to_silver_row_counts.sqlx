@@ -1,0 +1,78 @@
+config {
+  type: "assertion",
+  name: "assert_bronze_to_silver_row_counts",
+  description: "Ensure Bronze → Silver transformation doesn't lose significant data",
+  tags: ["quality", "silver", "reconciliation"]
+}
+
+/*
+ * Data Quality Check: Row Count Reconciliation
+ * 
+ * Verifies that Silver has at least 90% of Bronze rows.
+ * Some loss is acceptable due to filtering invalid records.
+ */
+
+WITH bronze_counts AS (
+  SELECT 
+    'channels' as resource,
+    bronze.snapshot_date,
+    SUM(ARRAY_LENGTH(bronze.items)) as bronze_count
+  FROM `tonal-transit-475913-a2.control.bronze_channels_external` AS bronze
+  ${ when(dataform.projectConfig.vars.target_date, 
+    `WHERE bronze.snapshot_date = '${dataform.projectConfig.vars.target_date}'`
+  ) }
+  GROUP BY bronze.snapshot_date
+  
+  UNION ALL
+  
+  SELECT 
+    'videos' as resource,
+    bronze.snapshot_date,
+    SUM(ARRAY_LENGTH(bronze.items)) as bronze_count
+  FROM `tonal-transit-475913-a2.control.bronze_videos_external` AS bronze
+  ${ when(dataform.projectConfig.vars.target_date, 
+    `WHERE bronze.snapshot_date = '${dataform.projectConfig.vars.target_date}'`
+  ) }
+  GROUP BY bronze.snapshot_date
+),
+
+silver_counts AS (
+  SELECT 
+    'channels' as resource,
+    snapshot_date,
+    COUNT(*) as silver_count
+  FROM ${ref("silver_channel")}
+  ${ when(dataform.projectConfig.vars.target_date, 
+    `WHERE snapshot_date = '${dataform.projectConfig.vars.target_date}'`
+  ) }
+  GROUP BY snapshot_date
+  
+  UNION ALL
+  
+  SELECT 
+    'videos' as resource,
+    snapshot_date,
+    COUNT(*) as silver_count
+  FROM ${ref("silver_video")}
+  ${ when(dataform.projectConfig.vars.target_date, 
+    `WHERE snapshot_date = '${dataform.projectConfig.vars.target_date}'`
+  ) }
+  GROUP BY snapshot_date
+)
+
+SELECT 
+  b.resource,
+  b.snapshot_date,
+  b.bronze_count,
+  s.silver_count,
+  ROUND((s.silver_count / b.bronze_count) * 100, 2) as retention_pct
+FROM bronze_counts b
+LEFT JOIN silver_counts s 
+  ON b.resource = s.resource 
+  AND b.snapshot_date = s.snapshot_date
+WHERE 
+  s.silver_count IS NULL  -- Silver data missing
+  OR (s.silver_count / b.bronze_count) < 0.90  -- Lost >10% of data
+
+-- If this query returns any rows, the assertion FAILS
+

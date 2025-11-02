@@ -1,0 +1,41 @@
+config {
+  type: "assertion",
+  name: "assert_silver_video_required_fields",
+  description: "Ensure all videos have required fields populated",
+  tags: ["quality", "silver", "videos"]
+}
+
+/*
+ * Data Quality Check: Required Fields
+ * 
+ * This assertion fails if any video is missing critical fields.
+ */
+
+SELECT 
+  video_id,
+  snapshot_date,
+  CASE 
+    WHEN video_id IS NULL THEN 'video_id is NULL'
+    WHEN channel_id IS NULL THEN 'channel_id is NULL'
+    WHEN title IS NULL OR title = '' THEN 'title is empty'
+    WHEN published_at IS NULL THEN 'published_at is NULL'
+    WHEN view_count IS NULL THEN 'view_count is NULL'
+    ELSE 'unknown'
+  END as issue
+FROM ${ref("silver_video")}
+WHERE 
+  (
+    video_id IS NULL 
+    OR channel_id IS NULL 
+    OR title IS NULL 
+    OR title = ''
+    OR published_at IS NULL
+    OR view_count IS NULL
+  )
+  ${ when(dataform.projectConfig.vars.target_date, 
+    `AND snapshot_date = '${dataform.projectConfig.vars.target_date}'`
+  ) }
+LIMIT 100;  -- Show first 100 issues
+
+-- If this query returns any rows, the assertion FAILS
+

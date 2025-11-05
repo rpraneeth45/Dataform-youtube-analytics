@@ -10,6 +10,14 @@ config {
  * 
  * Verifies that Silver has at least 90% of Bronze rows.
  * Some loss is acceptable due to filtering invalid records.
+ * 
+ * How it works:
+ * - Compares row counts between Bronze and Silver tables
+ * - Calculates retention percentage (Silver / Bronze)
+ * - Fails if retention < 90% or if Silver data is missing
+ * 
+ * Expected Result: 0 rows (retention >= 90% for all resources)
+ * Failure: Any rows returned = data loss detected = pipeline stops
  */
 
 WITH bronze_counts AS (
@@ -18,7 +26,15 @@ WITH bronze_counts AS (
     bronze.snapshot_date,
     SUM(ARRAY_LENGTH(bronze.items)) as bronze_count
   FROM `tonal-transit-475913-a2.control.bronze_channels_external` AS bronze
-  WHERE bronze.snapshot_date = '${dataform.projectConfig.vars.target_date}'
+  WHERE
+    -- If target_date is provided, check only that date
+    ${ when(dataform.projectConfig.vars.target_date, 
+      `bronze.snapshot_date = PARSE_DATE('%Y-%m-%d', '${dataform.projectConfig.vars.target_date}')`
+    ) }
+    -- If no target_date, check recent partitions (last 7 days)
+    ${ when(!dataform.projectConfig.vars.target_date, 
+      `bronze.snapshot_date >= DATE_SUB(CURRENT_DATE(), INTERVAL 7 DAY)`
+    ) }
   GROUP BY bronze.snapshot_date
   
   UNION ALL
@@ -28,7 +44,15 @@ WITH bronze_counts AS (
     bronze.snapshot_date,
     SUM(ARRAY_LENGTH(bronze.items)) as bronze_count
   FROM `tonal-transit-475913-a2.control.bronze_videos_external` AS bronze
-  WHERE bronze.snapshot_date = '${dataform.projectConfig.vars.target_date}'
+  WHERE
+    -- If target_date is provided, check only that date
+    ${ when(dataform.projectConfig.vars.target_date, 
+      `bronze.snapshot_date = PARSE_DATE('%Y-%m-%d', '${dataform.projectConfig.vars.target_date}')`
+    ) }
+    -- If no target_date, check recent partitions (last 7 days)
+    ${ when(!dataform.projectConfig.vars.target_date, 
+      `bronze.snapshot_date >= DATE_SUB(CURRENT_DATE(), INTERVAL 7 DAY)`
+    ) }
   GROUP BY bronze.snapshot_date
 ),
 
@@ -37,8 +61,16 @@ silver_counts AS (
     'channels' as resource,
     snapshot_date,
     COUNT(*) as silver_count
-  FROM ${ref("silver_channel")}
-  WHERE snapshot_date = '${dataform.projectConfig.vars.target_date}'
+  FROM ${ref("silver", "silver_channel")}
+  WHERE
+    -- If target_date is provided, check only that date
+    ${ when(dataform.projectConfig.vars.target_date, 
+      `snapshot_date = PARSE_DATE('%Y-%m-%d', '${dataform.projectConfig.vars.target_date}')`
+    ) }
+    -- If no target_date, check recent partitions (last 7 days)
+    ${ when(!dataform.projectConfig.vars.target_date, 
+      `snapshot_date >= DATE_SUB(CURRENT_DATE(), INTERVAL 7 DAY)`
+    ) }
   GROUP BY snapshot_date
   
   UNION ALL
@@ -47,8 +79,16 @@ silver_counts AS (
     'videos' as resource,
     snapshot_date,
     COUNT(*) as silver_count
-  FROM ${ref("silver_video")}
-  WHERE snapshot_date = '${dataform.projectConfig.vars.target_date}'
+  FROM ${ref("silver", "silver_video")}
+  WHERE
+    -- If target_date is provided, check only that date
+    ${ when(dataform.projectConfig.vars.target_date, 
+      `snapshot_date = PARSE_DATE('%Y-%m-%d', '${dataform.projectConfig.vars.target_date}')`
+    ) }
+    -- If no target_date, check recent partitions (last 7 days)
+    ${ when(!dataform.projectConfig.vars.target_date, 
+      `snapshot_date >= DATE_SUB(CURRENT_DATE(), INTERVAL 7 DAY)`
+    ) }
   GROUP BY snapshot_date
 )
 
@@ -57,14 +97,14 @@ SELECT
   b.snapshot_date,
   b.bronze_count,
   s.silver_count,
-  ROUND((s.silver_count / b.bronze_count) * 100, 2) as retention_pct
+  ROUND((s.silver_count / NULLIF(b.bronze_count, 0)) * 100, 2) as retention_pct
 FROM bronze_counts b
 LEFT JOIN silver_counts s 
   ON b.resource = s.resource 
   AND b.snapshot_date = s.snapshot_date
 WHERE 
-  s.silver_count IS NULL  -- Silver data missing
-  OR (s.silver_count / b.bronze_count) < 0.90  -- Lost >10% of data
-
--- If this query returns any rows, the assertion FAILS
+  -- Silver data missing entirely
+  s.silver_count IS NULL
+  -- OR retention rate is below 90%
+  OR (b.bronze_count > 0 AND (s.silver_count / b.bronze_count) < 0.90)
 

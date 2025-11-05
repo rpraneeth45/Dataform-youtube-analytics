@@ -9,10 +9,27 @@ config {
  * Data Quality Check: Required Fields
  * 
  * This assertion fails if any video is missing critical fields.
+ * 
+ * Required fields checked:
+ * - video_id: Primary identifier (must not be null)
+ * - channel_id: Foreign key to channel (must not be null)
+ * - title: Video title (must not be null or empty)
+ * - published_at: Video publish timestamp (must not be null)
+ * - view_count: View count metric (must not be null)
+ * - snapshot_date: Partition key (must not be null)
+ * 
+ * How it works:
+ * - Checks all required fields for NULL or empty values
+ * - Returns rows only when issues are found
+ * - Dataform will stop the pipeline if this query returns any rows
+ * 
+ * Expected Result: 0 rows (all required fields populated)
+ * Failure: Any rows returned = missing required fields = pipeline stops
  */
 
 SELECT 
   video_id,
+  COALESCE(title, '(title is NULL)') as title,
   snapshot_date,
   CASE 
     WHEN video_id IS NULL THEN 'video_id is NULL'
@@ -20,11 +37,19 @@ SELECT
     WHEN title IS NULL OR title = '' THEN 'title is empty'
     WHEN published_at IS NULL THEN 'published_at is NULL'
     WHEN view_count IS NULL THEN 'view_count is NULL'
+    WHEN snapshot_date IS NULL THEN 'snapshot_date is NULL'
     ELSE 'unknown'
   END as issue
-FROM ${ref("silver_video")}
+FROM ${ref("silver", "silver_video")}
 WHERE 
-  snapshot_date = '${dataform.projectConfig.vars.target_date}'
+  -- If target_date is provided, check only that date
+  ${ when(dataform.projectConfig.vars.target_date, 
+    `snapshot_date = PARSE_DATE('%Y-%m-%d', '${dataform.projectConfig.vars.target_date}')`
+  ) }
+  -- If no target_date, check recent partitions (last 7 days)
+  ${ when(!dataform.projectConfig.vars.target_date, 
+    `snapshot_date >= DATE_SUB(CURRENT_DATE(), INTERVAL 7 DAY)`
+  ) }
   AND (
     video_id IS NULL 
     OR channel_id IS NULL 
@@ -32,8 +57,5 @@ WHERE
     OR title = ''
     OR published_at IS NULL
     OR view_count IS NULL
+    OR snapshot_date IS NULL
   )
-LIMIT 100  -- Show first 100 issues
-
--- If this query returns any rows, the assertion FAILS
-

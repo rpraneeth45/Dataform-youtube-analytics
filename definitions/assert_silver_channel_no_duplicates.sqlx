@@ -10,16 +10,32 @@ config {
  * 
  * This assertion fails if any channel_id appears more than once
  * for the same snapshot_date in the silver_channel table.
+ * 
+ * How it works:
+ * - Groups by snapshot_date and channel_id (the composite key)
+ * - Counts occurrences per group
+ * - Returns rows only when COUNT(*) > 1 (duplicates found)
+ * - Dataform will stop the pipeline if this query returns any rows
+ * 
+ * Expected Result: 0 rows (no duplicates)
+ * Failure: Any rows returned = duplicates exist = pipeline stops
  */
 
 SELECT 
   snapshot_date,
   channel_id,
+  ANY_VALUE(channel_title) as channel_title,
   COUNT(*) as duplicate_count
-FROM ${ref("silver_channel")}
-WHERE snapshot_date = '${dataform.projectConfig.vars.target_date}'
+FROM ${ref("silver", "silver_channel")}
+WHERE
+  -- If target_date is provided, check only that date
+  ${ when(dataform.projectConfig.vars.target_date, 
+    `snapshot_date = PARSE_DATE('%Y-%m-%d', '${dataform.projectConfig.vars.target_date}')`
+  ) }
+  -- If no target_date, check recent partitions (last 7 days)
+  ${ when(!dataform.projectConfig.vars.target_date, 
+    `snapshot_date >= DATE_SUB(CURRENT_DATE(), INTERVAL 7 DAY)`
+  ) }
 GROUP BY snapshot_date, channel_id
 HAVING COUNT(*) > 1
-
--- If this query returns any rows, the assertion FAILS
 

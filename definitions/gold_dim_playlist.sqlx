@@ -1,5 +1,5 @@
 config {
-  type: "incremental",
+  type: "table",
   schema: "gold",
   name: "dim_playlist",
   description: "Playlist dimension with SCD2",
@@ -93,33 +93,13 @@ changed_playlists AS (
 ),
 
 -- Get max playlist_sk to generate new surrogate keys
--- Use direct table reference to avoid circular dependency in incremental mode
 max_playlist_sk AS (
   SELECT COALESCE(MAX(playlist_sk), 0) AS max_sk
   FROM `tonal-transit-475913-a2.gold.dim_playlist`
 ),
 
--- Prepare records to deactivate (previous records that are being superseded)
-records_to_deactivate AS (
-  SELECT
-    e.playlist_sk,
-    e.playlist_id,
-    e.title AS playlist_title,
-    e.item_count AS playlist_item_count,
-    e.published_at,
-    e.effective_start_date,
-    -- Set effective_end_date to yesterday (when new record takes effect)
-    DATE_SUB(CURRENT_DATE(), INTERVAL 1 DAY) AS effective_end_date,
-    -- Mark as inactive
-    FALSE AS is_current
-  FROM existing_current_records e
-  INNER JOIN changed_playlists c
-    ON e.playlist_id = c.playlist_id
-  WHERE c.has_change = TRUE
-),
-
--- Prepare new/updated records to activate
-records_to_activate AS (
+-- Prepare new/updated records to insert
+new_records AS (
   SELECT
     c.playlist_id,
     c.title AS playlist_title,
@@ -128,30 +108,34 @@ records_to_activate AS (
     -- Generate new surrogate key: use max_sk + row_number
     m.max_sk + ROW_NUMBER() OVER (ORDER BY c.playlist_id) AS playlist_sk,
     -- Set effective_start_date to today (audit column - insertion time)
-    CURRENT_DATE() AS effective_start_date,
-    -- No end date for current records (cast NULL as DATE to match UNION ALL type)
-    CAST(NULL AS DATE) AS effective_end_date,
-    -- Mark as current
-    TRUE AS is_current
+    CURRENT_DATE() AS effective_start_date
   FROM changed_playlists c
   CROSS JOIN max_playlist_sk m
   WHERE c.has_change = TRUE
 ),
 
--- Combine all records: deactivated + new/updated
-all_scd2_records AS (
+-- Get all existing records to calculate SCD2 fields for all records
+all_existing_records AS (
   SELECT
     playlist_sk,
     playlist_id,
     playlist_title,
     playlist_item_count,
     published_at,
-    -- Use published_at as created_at timestamp (original playlist creation time)
-    TIMESTAMP(published_at) AS created_at,
-    effective_start_date,
-    effective_end_date,
-    is_current
-  FROM records_to_deactivate
+    effective_start_date
+  FROM `tonal-transit-475913-a2.gold.dim_playlist`
+),
+
+-- Combine existing + new records to calculate effective_end_date for all records
+all_records AS (
+  SELECT
+    playlist_sk,
+    playlist_id,
+    playlist_title,
+    playlist_item_count,
+    published_at,
+    effective_start_date
+  FROM all_existing_records
   
   UNION ALL
   
@@ -161,14 +145,44 @@ all_scd2_records AS (
     playlist_title,
     playlist_item_count,
     published_at,
+    effective_start_date
+  FROM new_records
+),
+
+-- Calculate SCD2 fields using window functions
+-- This determines effective_end_date and is_current for all records
+scd2_calculated AS (
+  SELECT
+    playlist_sk,
+    playlist_id,
+    playlist_title,
+    playlist_item_count,
+    published_at,
     -- Use published_at as created_at timestamp (original playlist creation time)
     TIMESTAMP(published_at) AS created_at,
     effective_start_date,
-    effective_end_date,
-    is_current
-  FROM records_to_activate
+    -- Calculate effective_end_date: next record's effective_start_date - 1 day
+    DATE_SUB(
+      LEAD(effective_start_date) OVER (
+        PARTITION BY playlist_id 
+        ORDER BY effective_start_date
+      ),
+      INTERVAL 1 DAY
+    ) AS effective_end_date,
+    -- Calculate is_current: TRUE if this is the latest record for this playlist_id
+    CASE 
+      WHEN LEAD(effective_start_date) OVER (
+        PARTITION BY playlist_id 
+        ORDER BY effective_start_date
+      ) IS NULL THEN TRUE 
+      ELSE FALSE 
+    END AS is_current
+  FROM all_records
 )
 
+-- Build complete SCD2 table with all records and correct flags
+-- This replaces the entire table, ensuring all records have correct is_current and effective_end_date
+-- Note: ORDER BY removed to avoid conflict with table clustering
 SELECT
   playlist_sk,
   playlist_id,
@@ -179,4 +193,4 @@ SELECT
   effective_start_date,
   effective_end_date,
   is_current
-FROM all_scd2_records
+FROM scd2_calculated

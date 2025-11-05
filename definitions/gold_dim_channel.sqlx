@@ -14,6 +14,12 @@ config {
  * Channel dimension with SCD2 implementation
  * Tracks historical changes to channel attributes
  * Links to MCN groups for analytics
+ * 
+ * SCD2 Logic:
+ * - effective_start_date: Set to CURRENT_DATE() when record is inserted (audit column)
+ * - effective_end_date: Set to CURRENT_DATE() - 1 when record becomes inactive (audit column)
+ * - is_current: Automatically set to FALSE for previous records when new record arrives
+ * - created_at: Original channel creation timestamp from source data
  */
 
 WITH channel_data AS (
@@ -46,67 +52,141 @@ channel_with_mcn AS (
   LEFT JOIN mcn_lookup m ON c.mcn_group_id = m.mcn_group_id
 ),
 
--- SCD2 Logic: Detect changes and create effective date ranges
-channel_changes AS (
+-- Get latest snapshot per channel to identify current state
+latest_channel_snapshot AS (
   SELECT
     channel_id,
-    channel_title,
-    mcn_group_sk,
-    created_at,
-    snapshot_date,
-    
-    -- Detect changes
-    LAG(channel_title) OVER (
-      PARTITION BY channel_id 
-      ORDER BY snapshot_date
-    ) AS prev_channel_title,
-    
-    LAG(mcn_group_sk) OVER (
-      PARTITION BY channel_id 
-      ORDER BY snapshot_date
-    ) AS prev_mcn_group_sk,
-    
-    -- Row number for surrogate key
-    ROW_NUMBER() OVER (
-      PARTITION BY channel_id 
-      ORDER BY snapshot_date
-    ) AS row_num
+    MAX(snapshot_date) AS latest_snapshot_date
   FROM channel_with_mcn
+  GROUP BY channel_id
 ),
 
-scd2_records AS (
+-- Get current state from latest snapshot
+current_channel_state AS (
   SELECT
+    c.channel_id,
+    c.channel_title,
+    c.mcn_group_sk,
+    c.created_at,
+    c.snapshot_date
+  FROM channel_with_mcn c
+  INNER JOIN latest_channel_snapshot l
+    ON c.channel_id = l.channel_id
+    AND c.snapshot_date = l.latest_snapshot_date
+),
+
+-- Get existing current records from dimension table
+-- Use direct table reference to avoid circular dependency in incremental mode
+existing_current_records AS (
+  SELECT
+    channel_sk,
     channel_id,
     channel_title,
     mcn_group_sk,
     created_at,
-    snapshot_date,
-    
-    -- Create surrogate key
-    ROW_NUMBER() OVER (ORDER BY channel_id, snapshot_date) AS channel_sk,
-    
-    -- SCD2 effective dates
-    snapshot_date AS effective_start_date,
-    LEAD(snapshot_date) OVER (
-      PARTITION BY channel_id 
-      ORDER BY snapshot_date
-    ) AS effective_end_date,
-    
-    -- Current record flag
+    effective_start_date,
+    effective_end_date,
+    is_current
+  FROM `tonal-transit-475913-a2.gold.dim_channel`
+  WHERE is_current = TRUE
+),
+
+-- Detect changes: compare current state with existing records
+changed_channels AS (
+  SELECT
+    c.channel_id,
+    c.channel_title,
+    c.mcn_group_sk,
+    c.created_at,
+    e.channel_sk AS existing_channel_sk,
+    e.channel_title AS existing_channel_title,
+    e.mcn_group_sk AS existing_mcn_group_sk,
+    -- Check if any attribute changed
     CASE 
-      WHEN LEAD(snapshot_date) OVER (
-        PARTITION BY channel_id 
-        ORDER BY snapshot_date
-      ) IS NULL THEN TRUE 
-      ELSE FALSE 
-    END AS is_current
-    
-  FROM channel_changes
-  WHERE 
-    -- Only include records where something changed
-    (channel_title != prev_channel_title OR prev_channel_title IS NULL)
-    OR (mcn_group_sk != prev_mcn_group_sk OR prev_mcn_group_sk IS NULL)
-    OR row_num = 1  -- Always include first record
+      WHEN e.channel_id IS NULL THEN TRUE  -- New channel
+      WHEN c.channel_title != e.channel_title THEN TRUE  -- Title changed
+      WHEN c.mcn_group_sk != e.mcn_group_sk 
+        OR (c.mcn_group_sk IS NULL AND e.mcn_group_sk IS NOT NULL)
+        OR (c.mcn_group_sk IS NOT NULL AND e.mcn_group_sk IS NULL)
+      THEN TRUE  -- MCN group changed
+      ELSE FALSE  -- No change
+    END AS has_change
+  FROM current_channel_state c
+  LEFT JOIN existing_current_records e
+    ON c.channel_id = e.channel_id
+),
+
+-- Prepare records to deactivate (previous records that are being superseded)
+records_to_deactivate AS (
+  SELECT
+    e.channel_sk,
+    e.channel_id,
+    e.channel_title,
+    e.mcn_group_sk,
+    e.created_at,
+    e.effective_start_date,
+    -- Set effective_end_date to yesterday (when new record takes effect)
+    DATE_SUB(CURRENT_DATE(), INTERVAL 1 DAY) AS effective_end_date,
+    -- Mark as inactive
+    FALSE AS is_current
+  FROM existing_current_records e
+  INNER JOIN changed_channels c
+    ON e.channel_id = c.channel_id
+  WHERE c.has_change = TRUE
+),
+
+-- Get max channel_sk to generate new surrogate keys
+-- Use direct table reference to avoid circular dependency in incremental mode
+max_channel_sk AS (
+  SELECT COALESCE(MAX(channel_sk), 0) AS max_sk
+  FROM `tonal-transit-475913-a2.gold.dim_channel`
+),
+
+-- Prepare new/updated records to activate
+records_to_activate AS (
+  SELECT
+    c.channel_id,
+    c.channel_title,
+    c.mcn_group_sk,
+    c.created_at,
+    -- Generate new surrogate key: use max_sk + row_number for new records
+    m.max_sk + ROW_NUMBER() OVER (ORDER BY c.channel_id) AS channel_sk,
+    -- Set effective_start_date to today (audit column - insertion time)
+    CURRENT_DATE() AS effective_start_date,
+    -- No end date for current records (cast NULL as DATE to match UNION ALL type)
+    CAST(NULL AS DATE) AS effective_end_date,
+    -- Mark as current
+    TRUE AS is_current
+  FROM changed_channels c
+  CROSS JOIN max_channel_sk m
+  WHERE c.has_change = TRUE
+),
+
+-- Combine all records: deactivated + new/updated
+all_scd2_records AS (
+  SELECT
+    channel_sk,
+    channel_id,
+    channel_title,
+    mcn_group_sk,
+    created_at,
+    effective_start_date,
+    effective_end_date,
+    is_current
+  FROM records_to_deactivate
+  
+  UNION ALL
+  
+  SELECT
+    channel_sk,
+    channel_id,
+    channel_title,
+    mcn_group_sk,
+    created_at,
+    effective_start_date,
+    effective_end_date,
+    is_current
+  FROM records_to_activate
 )
 
 SELECT
@@ -118,4 +198,4 @@ SELECT
   effective_start_date,
   effective_end_date,
   is_current
-FROM scd2_records
+FROM all_scd2_records

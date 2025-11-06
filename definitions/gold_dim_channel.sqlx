@@ -26,15 +26,46 @@ config {
  * To get current records, filter by: effective_start_date = MAX(effective_start_date) per channel_id
  */
 
-WITH channel_data AS (
-  SELECT
-    channel_id,
-    channel_title,
-    mcn_group_id,
-    created_at,
-    snapshot_date
+WITH
+-- Get channels that have snapshots in the date range (for incremental efficiency)
+-- During incremental runs, only process entities that changed in last 7 days
+-- But include ALL historical snapshots for those entities (needed for SCD2)
+channels_in_range AS (
+  SELECT DISTINCT channel_id
   FROM ${ref("silver", "silver_channel")}
-  WHERE channel_id IS NOT NULL
+  WHERE 
+    channel_id IS NOT NULL
+    -- Date filter: process specific date from DAG parameter (if provided)
+    ${ when(dataform.projectConfig.vars.target_date, 
+      `AND snapshot_date = PARSE_DATE('%Y-%m-%d', '${dataform.projectConfig.vars.target_date}')`
+    ) }
+    -- Incremental mode: only process entities with snapshots in last 7 days
+    -- Only applies when: no full_refresh variable AND no target_date
+    ${ when(!dataform.projectConfig.vars.full_refresh && !dataform.projectConfig.vars.target_date, 
+      `AND snapshot_date >= DATE_SUB(CURRENT_DATE(), INTERVAL 7 DAY)`
+    ) }
+    -- If full_refresh is set, process ALL channels (no filter)
+),
+
+-- Get ALL historical data for channels in range (needed for complete SCD2 timelines)
+channel_data AS (
+  SELECT
+    c.channel_id,
+    c.channel_title,
+    c.mcn_group_id,
+    c.created_at,
+    c.snapshot_date
+  FROM ${ref("silver", "silver_channel")} c
+  ${ when(!dataform.projectConfig.vars.full_refresh && !dataform.projectConfig.vars.target_date, 
+    `INNER JOIN channels_in_range cir ON c.channel_id = cir.channel_id`
+  ) }
+  WHERE 
+    c.channel_id IS NOT NULL
+    -- Date filter: process specific date from DAG parameter (if provided)
+    ${ when(dataform.projectConfig.vars.target_date, 
+      `AND c.snapshot_date = PARSE_DATE('%Y-%m-%d', '${dataform.projectConfig.vars.target_date}')`
+    ) }
+    -- If full_refresh is set, process ALL dates from Silver (no filter)
 ),
 
 mcn_lookup AS (

@@ -5,6 +5,8 @@ config {
   description: "Bridge table: playlist to video mapping",
   tags: ["gold", "bridge", "playlist", "video"],
   
+  uniqueKey: ["playlist_sk", "video_sk"],
+  
   bigquery: {
     clusterBy: ["playlist_sk", "video_sk"]
   }
@@ -23,8 +25,19 @@ WITH playlist_video_data AS (
     pv.is_current,
     pv.snapshot_date
   FROM ${ref("silver", "silver_playlist_video")} pv
-  WHERE pv.playlist_id IS NOT NULL 
+  WHERE 
+    pv.playlist_id IS NOT NULL 
     AND pv.video_id IS NOT NULL
+    -- Date filter: process specific date from DAG parameter (if provided)
+    ${ when(dataform.projectConfig.vars.target_date, 
+      `AND pv.snapshot_date = PARSE_DATE('%Y-%m-%d', '${dataform.projectConfig.vars.target_date}')`
+    ) }
+    -- Incremental mode: process last 7 days rolling window (if not full refresh and no target_date)
+    -- Only applies when: incremental mode AND no full_refresh variable AND no target_date
+    ${ when(incremental() && !dataform.projectConfig.vars.full_refresh && !dataform.projectConfig.vars.target_date, 
+      `AND pv.snapshot_date >= DATE_SUB(CURRENT_DATE(), INTERVAL 7 DAY)`
+    ) }
+    -- If full_refresh is set or first run, process ALL dates from Silver
 ),
 
 -- Get current playlist and video surrogate keys

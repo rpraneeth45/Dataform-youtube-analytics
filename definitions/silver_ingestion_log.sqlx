@@ -2,13 +2,14 @@ config {
   type: "incremental",
   schema: "silver",
   name: "silver_ingestion_log",
-  description: "Ingestion status log by channel with error tracking",
+  description: "Ingestion status log by channel with error tracking (transactional - one record per channel per date)",
   tags: ["silver", "monitoring"],
+  
+  uniqueKey: ["channel_id", "snapshot_date"],
   
   bigquery: {
     partitionBy: "snapshot_date",
-    clusterBy: ["channel_id"],
-    updatePartitionFilter: "snapshot_date >= DATE_SUB(CURRENT_DATE(), INTERVAL 7 DAY)"
+    clusterBy: ["channel_id"]
   },
   
   columns: {
@@ -51,14 +52,23 @@ WITH ranked_runs AS (
       ORDER BY run_id DESC
     ) AS rn
   
-  FROM `tonal-transit-475913-a2.control.ingestion_run_channels`
+  FROM ${ref("control", "ingestion_run_channels")}
   
   WHERE
-    1=1
-    -- Date filter: process specific date from DAG parameter
+    -- Always include valid run_date filter to ensure WHERE clause is never empty
+    run_date IS NOT NULL
+    
+    -- Date filter: process specific date from DAG parameter (if provided)
     ${ when(dataform.projectConfig.vars.target_date, 
       `AND run_date = '${dataform.projectConfig.vars.target_date}'`
     ) }
+    
+    -- Incremental mode: process last 7 days rolling window (if not full refresh and no target_date)
+    -- Only applies when: incremental mode AND no full_refresh variable AND no target_date
+    ${ when(incremental() && !dataform.projectConfig.vars.full_refresh && !dataform.projectConfig.vars.target_date, 
+      `AND run_date >= DATE_SUB(CURRENT_DATE(), INTERVAL 7 DAY)`
+    ) }
+    -- If full_refresh is set or first run, process ALL dates from control table (no additional filter)
 )
 
 SELECT
@@ -80,4 +90,3 @@ FROM ranked_runs
 WHERE 
   -- Only keep the most recent run per channel per day
   rn = 1
-

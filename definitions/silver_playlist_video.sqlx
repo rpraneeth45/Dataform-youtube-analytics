@@ -2,13 +2,14 @@ config {
   type: "incremental",
   schema: "silver",
   name: "silver_playlist_video",
-  description: "Mapping of videos to playlists with position tracking",
+  description: "Mapping of videos to playlists with position tracking (transactional - one record per playlist-video per date)",
   tags: ["silver", "playlists", "videos"],
+  
+  uniqueKey: ["playlist_id", "video_id", "snapshot_date"],
   
   bigquery: {
     partitionBy: "snapshot_date",
-    clusterBy: ["playlist_id", "video_id"],
-    updatePartitionFilter: "snapshot_date >= DATE_SUB(CURRENT_DATE(), INTERVAL 7 DAY)"
+    clusterBy: ["playlist_id", "video_id"]
   },
   
   columns: {
@@ -20,61 +21,121 @@ config {
   }
 }
 
-/*
- * Transform Bronze playlist items to Silver layer
- * 
- * Source: control.bronze_playlist_items_external (GCS external table)
- * Target: silver.silver_playlist_video (native BigQuery table)
- * 
- * Transformations:
- * - Extract playlist-video relationships
- * - Track position in playlist
- * - Mark current snapshot (most recent for each playlist-video pair)
- */
 
+/*
+ * Step 1: UNNEST bronze playlist items data
+ * Unnests the items array from bronze_playlist_items_external to create one row per video in playlist
+ */
 WITH playlist_items AS (
   SELECT
+    -- Playlist identifier from bronze table struct (bronze.playlist_id)
     bronze.playlist_id AS playlist_id,
+    
+    -- Video identifier from YouTube API response (item.contentDetails.videoId)
     item.contentDetails.videoId AS video_id,
+    
+    -- Position of video in playlist (0-indexed) from YouTube API (item.snippet.position)
     item.snippet.position AS position,
+    
+    -- Date of data snapshot from bronze table struct (bronze.snapshot_date)
     bronze.snapshot_date AS snapshot_date
+  
   FROM 
     `tonal-transit-475913-a2.control.bronze_playlist_items_external` AS bronze
   CROSS JOIN UNNEST(bronze.items) AS item
+  
   WHERE
+    -- Only process records with valid playlist and video IDs
     bronze.playlist_id IS NOT NULL
     AND item.contentDetails.videoId IS NOT NULL
     
-    -- Date filter: process specific date from DAG parameter
+    -- Date filter: process specific date from DAG parameter (if provided)
     ${ when(dataform.projectConfig.vars.target_date, 
       `AND bronze.snapshot_date = PARSE_DATE('%Y-%m-%d', '${dataform.projectConfig.vars.target_date}')`
     ) }
     
-    -- Incremental filter if no target_date specified
-    ${ when(incremental() && !dataform.projectConfig.vars.target_date, 
-      `AND bronze.snapshot_date >= DATE_SUB(CURRENT_DATE(), INTERVAL 7 DAY)`) }
+    -- Incremental mode: process last 7 days rolling window (if not full refresh and no target_date)
+    -- Only applies when: incremental mode AND no full_refresh variable AND no target_date
+    ${ when(incremental() && !dataform.projectConfig.vars.full_refresh && !dataform.projectConfig.vars.target_date, 
+      `AND bronze.snapshot_date >= DATE_SUB(CURRENT_DATE(), INTERVAL 7 DAY)`
+    ) }
+    -- If full_refresh is set or first run, process ALL dates from Bronze
 ),
 
+/*
+ * Step 2: Deduplicate playlist items
+ * Removes duplicates when same playlist_id + video_id appears multiple times for the same snapshot_date
+ * Uses ROW_NUMBER() partitioned by playlist_id + video_id + snapshot_date
+ * Orders by position ASC (prefer earlier position in playlist)
+ */
+deduplicated_playlist_items AS (
+  SELECT
+    playlist_id,
+    video_id,
+    position,
+    snapshot_date,
+    -- Row number for deduplication: 1 = keep, >1 = duplicate
+    ROW_NUMBER() OVER (
+      PARTITION BY playlist_id, video_id, snapshot_date 
+      ORDER BY position ASC  -- Prefer earlier position in playlist
+    ) AS rn
+  FROM playlist_items
+),
+
+/*
+ * Step 3: Filter to unique records
+ * Keeps only the first row per playlist_id + video_id + snapshot_date combination
+ */
+deduplicated_items AS (
+  SELECT
+    playlist_id,
+    video_id,
+    position,
+    snapshot_date
+  FROM deduplicated_playlist_items
+  WHERE rn = 1
+),
+
+/*
+ * Step 4: Calculate latest snapshot per playlist-video pair
+ * Finds the maximum snapshot_date for each playlist_id + video_id combination
+ * Used to determine which records are "current" (most recent)
+ */
 latest_snapshots AS (
   SELECT
     playlist_id,
     video_id,
     MAX(snapshot_date) AS latest_snapshot_date
-  FROM playlist_items
+  FROM deduplicated_items
   GROUP BY playlist_id, video_id
 )
 
+/*
+ * Step 5: Final SELECT with is_current flag
+ * Marks records as current if they represent the latest snapshot for that playlist-video pair
+ */
 SELECT
-  pi.playlist_id,
-  pi.video_id,
-  pi.position,
+  -- Playlist identifier from deduplicated items
+  di.playlist_id,
+  
+  -- Video identifier from deduplicated items
+  di.video_id,
+  
+  -- Position of video in playlist from deduplicated items
+  di.position,
+  
+  -- Boolean flag: TRUE if this snapshot_date is the latest for this playlist-video pair
+  -- Derived by comparing snapshot_date with latest_snapshot_date from latest_snapshots CTE
   CASE 
-    WHEN pi.snapshot_date = ls.latest_snapshot_date THEN TRUE 
+    WHEN di.snapshot_date = ls.latest_snapshot_date THEN TRUE 
     ELSE FALSE 
   END AS is_current,
-  pi.snapshot_date
-FROM playlist_items pi
-LEFT JOIN latest_snapshots ls
-  ON pi.playlist_id = ls.playlist_id
-  AND pi.video_id = ls.video_id
+  
+  -- Date of data snapshot from deduplicated items
+  di.snapshot_date
 
+FROM deduplicated_items di
+-- Join to latest_snapshots to determine which records are current
+LEFT JOIN latest_snapshots ls
+  ON di.playlist_id = ls.playlist_id
+  AND di.video_id = ls.video_id

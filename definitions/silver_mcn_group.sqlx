@@ -2,13 +2,14 @@ config {
   type: "incremental",
   schema: "silver",
   name: "silver_mcn_group",
-  description: "Multi-Channel Network (MCN) groups - daily snapshot",
+  description: "Multi-Channel Network (MCN) groups - daily snapshot (transactional - one record per MCN per date)",
   tags: ["silver", "mcn"],
+  
+  uniqueKey: ["mcn_group_id", "snapshot_date"],
   
   bigquery: {
     partitionBy: "snapshot_date",
-    clusterBy: ["mcn_group_id"],
-    updatePartitionFilter: "snapshot_date >= DATE_SUB(CURRENT_DATE(), INTERVAL 7 DAY)"
+    clusterBy: ["mcn_group_id"]
   },
   
   columns: {
@@ -50,9 +51,8 @@ SELECT
   ) }
 
 FROM 
-  `tonal-transit-475913-a2.control.mcn_registry`
+  ${ref("control", "mcn_registry")}
 
 WHERE
   -- Only include active MCNs
   is_active = TRUE
-

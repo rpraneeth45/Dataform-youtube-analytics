@@ -2,13 +2,14 @@ config {
   type: "incremental",
   schema: "silver",
   name: "silver_channel",
-  description: "YouTube channel metadata with statistics",
+  description: "YouTube channel metadata with statistics (transactional - one record per channel per date)",
   tags: ["silver", "channels"],
+  
+  uniqueKey: ["channel_id", "snapshot_date"],
   
   bigquery: {
     partitionBy: "snapshot_date",
-    clusterBy: ["channel_id"],
-    updatePartitionFilter: "snapshot_date >= DATE_SUB(CURRENT_DATE(), INTERVAL 7 DAY)"
+    clusterBy: ["channel_id"]
   },
   
   columns: {
@@ -25,66 +26,187 @@ config {
   }
 }
 
+
 /*
- * Transform Bronze channel data to Silver layer
- * 
- * Source: control.bronze_channels_external (GCS external table)
- * Target: silver.silver_channel (native BigQuery table)
- * 
- * Transformations:
- * - Parse nested JSON structure from YouTube API
- * - Extract channel metadata and statistics
- * - Join with MCN registry for mcn_group_id
- * - Clean and type-cast fields
- * 
- * Incremental Logic:
- * - Updates partitions from last 7 days (configurable)
- * - Full refresh available by removing incremental config
+ * Step 1: UNNEST bronze channels data
+ * Unnests the items array from bronze_channels_external to create one row per channel
  */
+WITH unnested_channels AS (
+  SELECT
+    -- Channel identifier from YouTube API response (item.id)
+    item.id AS channel_id,
+    
+    -- Channel display name from YouTube API response (item.snippet.title)
+    item.snippet.title AS channel_title,
+    
+    -- Channel country code from YouTube API response (item.snippet.country)
+    item.snippet.country AS country,
+    
+    -- Channel creation timestamp from YouTube API response (item.snippet.publishedAt)
+    item.snippet.publishedAt AS created_at,
+    
+    -- Total subscriber count from YouTube API statistics (item.statistics.subscriberCount)
+    item.statistics.subscriberCount AS subscriber_count,
+    
+    -- Total view count across all videos from YouTube API statistics (item.statistics.viewCount)
+    item.statistics.viewCount AS view_count_total,
+    
+    -- Total number of videos published from YouTube API statistics (item.statistics.videoCount)
+    item.statistics.videoCount AS video_count_total,
+    
+    -- Date of data snapshot from bronze table (bronze.snapshot_date)
+    bronze.snapshot_date AS snapshot_date,
+    
+    -- Batch ID from bronze table for deduplication ordering (bronze.batch_id)
+    bronze.batch_id AS batch_id
+    
+  FROM 
+    `tonal-transit-475913-a2.control.bronze_channels_external` AS bronze
+  CROSS JOIN UNNEST(bronze.items) AS item
+  
+  WHERE
+    -- Only process records with valid channel IDs
+    item.id IS NOT NULL
+    
+    -- Date filter: process specific date from DAG parameter (if provided)
+    ${ when(dataform.projectConfig.vars.target_date, 
+      `AND bronze.snapshot_date = PARSE_DATE('%Y-%m-%d', '${dataform.projectConfig.vars.target_date}')`
+    ) }
+    
+    -- Incremental mode: process last 7 days rolling window (if not full refresh and no target_date)
+    -- Only applies when: incremental mode AND no full_refresh variable AND no target_date
+    ${ when(incremental() && !dataform.projectConfig.vars.full_refresh && !dataform.projectConfig.vars.target_date, 
+      `AND bronze.snapshot_date >= DATE_SUB(CURRENT_DATE(), INTERVAL 7 DAY)`
+    ) }
+    -- If full_refresh is set or first run, process ALL dates from Bronze
+),
 
-SELECT
-  -- Identifiers
-  item.id AS channel_id,
-  item.snippet.title AS channel_title,
-  
-  -- MCN Group (join with registry)
-  mcn.mcn_id AS mcn_group_id,
-  
-  -- Channel Metadata
-  item.snippet.country AS country,
-  item.snippet.publishedAt AS created_at,
-  
-  -- Status (always active if data exists)
-  TRUE AS is_active,
-  
-  -- Statistics
-  item.statistics.subscriberCount AS subscriber_count,
-  item.statistics.viewCount AS view_count_total,
-  item.statistics.videoCount AS video_count_total,
-  
-  -- Partition Key (from Hive partition - already a DATE)
-  bronze.snapshot_date AS snapshot_date
+/*
+ * Step 2: Deduplicate channels
+ * Removes duplicates when same channel_id appears multiple times for the same snapshot_date
+ * Uses ROW_NUMBER() partitioned by channel_id + snapshot_date, ordered by batch_id DESC
+ * This ensures we keep only one record per channel per snapshot_date (preferring latest batch)
+ */
+deduplicated_channels AS (
+  SELECT
+    channel_id,
+    channel_title,
+    country,
+    created_at,
+    subscriber_count,
+    view_count_total,
+    video_count_total,
+    snapshot_date,
+    -- Row number for deduplication: 1 = keep, >1 = duplicate
+    ROW_NUMBER() OVER (
+      PARTITION BY channel_id, snapshot_date 
+      ORDER BY batch_id DESC  -- Prefer latest batch if multiple exist
+    ) AS rn
+  FROM unnested_channels
+),
 
-FROM 
-  `tonal-transit-475913-a2.control.bronze_channels_external` AS bronze
-CROSS JOIN UNNEST(bronze.items) AS item
-
--- Join with MCN registry to get mcn_group_id
-LEFT JOIN `tonal-transit-475913-a2.control.channels_registry` AS registry
-  ON item.id = registry.channel_id
-LEFT JOIN `tonal-transit-475913-a2.control.mcn_registry` AS mcn
-  ON registry.mcn_id = mcn.mcn_id
-
-WHERE
-  -- Only process records with valid channel IDs
-  item.id IS NOT NULL
+/*
+ * Step 3: Join with MCN registry tables
+ * Joins with channels_registry and mcn_registry to enrich with MCN group information
+ * Uses aggregation functions to handle any potential duplicates from JOINs
+ */
+channels_with_mcn AS (
+  SELECT
+    -- Channel identifier from deduplicated bronze data
+    dc.channel_id,
+    
+    -- Channel display name from deduplicated bronze data (use ANY_VALUE to handle duplicates)
+    ANY_VALUE(dc.channel_title) AS channel_title,
+    
+    -- MCN group identifier from mcn_registry table (via channels_registry join)
+    -- Use ANY_VALUE to handle potential duplicates in registry tables
+    ANY_VALUE(mcn.mcn_id) AS mcn_group_id,
+    
+    -- Channel country code from deduplicated bronze data
+    ANY_VALUE(dc.country) AS country,
+    
+    -- Channel creation timestamp from deduplicated bronze data
+    ANY_VALUE(dc.created_at) AS created_at,
+    
+    -- Hardcoded flag: all channels in snapshot are considered active
+    TRUE AS is_active,
+    
+    -- Total subscriber count from deduplicated bronze data
+    -- Use MAX to handle any variations (prefer non-NULL, higher values)
+    MAX(dc.subscriber_count) AS subscriber_count,
+    
+    -- Total view count from deduplicated bronze data
+    -- Use MAX to handle any variations
+    MAX(dc.view_count_total) AS view_count_total,
+    
+    -- Total video count from deduplicated bronze data
+    -- Use MAX to handle any variations
+    MAX(dc.video_count_total) AS video_count_total,
+    
+    -- Date of data snapshot from deduplicated bronze data
+    dc.snapshot_date
+    
+  FROM deduplicated_channels AS dc
+  -- Join to channels_registry to get MCN mapping
+  LEFT JOIN `tonal-transit-475913-a2.control.channels_registry` AS registry
+    ON dc.channel_id = registry.channel_id
+  -- Join to mcn_registry to get MCN group details
+  LEFT JOIN `tonal-transit-475913-a2.control.mcn_registry` AS mcn
+    ON registry.mcn_id = mcn.mcn_id
   
-  -- Date filter: process specific date from DAG parameter
-  ${ when(dataform.projectConfig.vars.target_date, 
-    `AND bronze.snapshot_date = PARSE_DATE('%Y-%m-%d', '${dataform.projectConfig.vars.target_date}')`
-  ) }
+  WHERE
+    -- Only keep the first row per channel_id + snapshot_date (deduplication filter)
+    dc.rn = 1
   
-  -- Incremental filter: only reprocess recent partitions if no target_date specified
-  ${ when(incremental() && !dataform.projectConfig.vars.target_date, 
-    `AND bronze.snapshot_date >= DATE_SUB(CURRENT_DATE(), INTERVAL 7 DAY)`) }
+  GROUP BY
+    dc.channel_id,
+    dc.snapshot_date
+),
 
+/*
+ * Step 4: Final deduplication and SELECT
+ * Final deduplication layer to ensure no duplicates exist
+ * Uses ROW_NUMBER() to handle any edge cases or existing duplicates
+ * This ensures absolute uniqueness even if previous steps or existing data had duplicates
+ */
+final_deduplicated AS (
+  SELECT
+    channel_id,
+    channel_title,
+    mcn_group_id,
+    country,
+    created_at,
+    is_active,
+    subscriber_count,
+    view_count_total,
+    video_count_total,
+    snapshot_date,
+    -- Final deduplication: ensure only one record per channel_id + snapshot_date
+    -- Use deterministic ordering to ensure consistent results
+    ROW_NUMBER() OVER (
+      PARTITION BY channel_id, snapshot_date
+      ORDER BY 
+        subscriber_count DESC NULLS LAST,  -- Prefer records with higher subscriber counts
+        view_count_total DESC NULLS LAST,  -- Then higher view counts
+        channel_title ASC NULLS LAST,      -- Then alphabetical by title for deterministic tie-breaking
+        COALESCE(created_at, TIMESTAMP('1970-01-01')) DESC  -- Then by created_at for final tie-break
+    ) AS final_rn
+  FROM channels_with_mcn
+)
+
+-- Final SELECT with DISTINCT to ensure absolute uniqueness
+-- This is critical for incremental runs where Dataform's uniqueKey upsert
+-- needs the query output to be unique before processing
+SELECT DISTINCT
+  channel_id,
+  channel_title,
+  mcn_group_id,
+  country,
+  created_at,
+  is_active,
+  subscriber_count,
+  view_count_total,
+  video_count_total,
+  snapshot_date
+FROM final_deduplicated
+WHERE final_rn = 1

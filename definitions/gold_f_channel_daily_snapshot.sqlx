@@ -5,6 +5,8 @@ config {
   description: "Channel daily snapshot with cumulative metrics and deltas",
   tags: ["gold", "fact", "channel", "snapshot"],
   
+  uniqueKey: ["date_key", "channel_sk"],
+  
   bigquery: {
     clusterBy: ["date_key", "channel_sk"]
   }
@@ -23,7 +25,18 @@ WITH channel_data AS (
     video_count_total,
     snapshot_date
   FROM ${ref("silver", "silver_channel")}
-  WHERE channel_id IS NOT NULL
+  WHERE 
+    channel_id IS NOT NULL
+    -- Date filter: process specific date from DAG parameter (if provided)
+    ${ when(dataform.projectConfig.vars.target_date, 
+      `AND snapshot_date = PARSE_DATE('%Y-%m-%d', '${dataform.projectConfig.vars.target_date}')`
+    ) }
+    -- Incremental mode: process last 7 days rolling window (if not full refresh and no target_date)
+    -- Only applies when: incremental mode AND no full_refresh variable AND no target_date
+    ${ when(incremental() && !dataform.projectConfig.vars.full_refresh && !dataform.projectConfig.vars.target_date, 
+      `AND snapshot_date >= DATE_SUB(CURRENT_DATE(), INTERVAL 7 DAY)`
+    ) }
+    -- If full_refresh is set or first run, process ALL dates from Silver
 ),
 
 channel_lookup AS (

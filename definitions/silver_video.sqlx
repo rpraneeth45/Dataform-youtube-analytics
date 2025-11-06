@@ -2,128 +2,226 @@ config {
   type: "incremental",
   schema: "silver",
   name: "silver_video",
-  description: "YouTube video metadata with engagement metrics and SEO scoring",
+  description: "YouTube video metadata with derived SEO metrics (transactional - one record per video per date)",
   tags: ["silver", "videos"],
+  
+  uniqueKey: ["video_id", "snapshot_date"],
   
   bigquery: {
     partitionBy: "snapshot_date",
-    clusterBy: ["channel_id", "video_id"],
-    updatePartitionFilter: "snapshot_date >= DATE_SUB(CURRENT_DATE(), INTERVAL 7 DAY)"
+    clusterBy: ["channel_id", "video_id"]
   },
   
   columns: {
-    video_id: "YouTube video ID (primary key with snapshot_date)",
-    channel_id: "Channel that published this video",
+    video_id: "YouTube video ID",
+    channel_id: "YouTube channel ID (foreign key)",
     title: "Video title",
     description: "Video description",
-    published_at: "Video publication timestamp",
+    published_at: "Video publish timestamp",
     duration_sec: "Video duration in seconds",
     category_id: "YouTube category ID",
     has_tags: "Whether video has tags",
     has_captions: "Whether video has captions",
     has_custom_thumbnail: "Whether video has custom thumbnail",
-    view_count: "Total view count",
-    like_count: "Total like count",
-    comment_count: "Total comment count",
-    title_len: "Title length in characters",
-    description_len: "Description length in characters",
-    seo_score: "SEO score (0-100) based on metadata completeness",
+    view_count: "Number of views",
+    like_count: "Number of likes",
+    comment_count: "Number of comments",
+    title_len: "Length of title (characters)",
+    description_len: "Length of description (characters)",
+    seo_score: "Calculated SEO score (0-100)",
     snapshot_date: "Date of data snapshot (partition key)"
   }
 }
 
+
 /*
- * Transform Bronze video data to Silver layer
- * 
- * Source: control.bronze_videos_external (GCS external table)
- * Target: silver.silver_video (native BigQuery table)
- * 
- * Transformations:
- * - Extract video metadata and statistics
- * - Parse ISO 8601 duration to seconds
- * - Calculate SEO score based on metadata completeness
- * - Clean and type-cast fields
+ * Step 1: UNNEST bronze videos data
+ * Unnests the items array from bronze_videos_external to create one row per video
  */
+WITH unnested_videos AS (
+  SELECT
+    -- Video identifier from YouTube API response (item.id)
+    item.id AS video_id,
+    
+    -- Channel identifier from bronze table struct (bronze.channel_id)
+    bronze.channel_id AS channel_id,
+    
+    -- Video title from YouTube API response (item.snippet.title)
+    item.snippet.title AS title,
+    
+    -- Video description from YouTube API response (item.snippet.description)
+    item.snippet.description AS description,
+    
+    -- Video publish timestamp from YouTube API response (item.snippet.publishedAt)
+    -- Already a TIMESTAMP type from struct
+    item.snippet.publishedAt AS published_at,
+    
+    -- Video duration in seconds, parsed from ISO 8601 duration format (PT1H2M30S)
+    -- Extracts hours, minutes, seconds and converts to total seconds
+    (
+      COALESCE(CAST(REGEXP_EXTRACT(item.contentDetails.duration, r'PT(\d+)H') AS INT64), 0) * 3600 +
+      COALESCE(CAST(REGEXP_EXTRACT(item.contentDetails.duration, r'(\d+)M') AS INT64), 0) * 60 +
+      COALESCE(CAST(REGEXP_EXTRACT(item.contentDetails.duration, r'(\d+)S') AS INT64), 0)
+    ) AS duration_sec,
+    
+    -- YouTube category ID from YouTube API response (item.snippet.categoryId)
+    item.snippet.categoryId AS category_id,
+    
+    -- Boolean flag: whether video has tags (item.snippet.tags)
+    -- TRUE if tags array exists and is not null
+    CASE 
+      WHEN item.snippet.tags IS NOT NULL 
+      THEN TRUE 
+      ELSE FALSE 
+    END AS has_tags,
+    
+    -- Boolean flag: whether video has captions (item.contentDetails.caption)
+    -- TRUE if caption field equals 'true'
+    CAST(item.contentDetails.caption AS BOOL) AS has_captions,
+    
+    -- Boolean flag: whether video has custom thumbnail (item.snippet.thumbnails.maxres.url)
+    -- TRUE if maxres thumbnail URL exists
+    CASE 
+      WHEN item.snippet.thumbnails.maxres.url IS NOT NULL 
+      THEN TRUE 
+      ELSE FALSE 
+    END AS has_custom_thumbnail,
+    
+    -- Number of views from YouTube API statistics (item.statistics.viewCount)
+    item.statistics.viewCount AS view_count,
+    
+    -- Number of likes from YouTube API statistics (item.statistics.likeCount)
+    item.statistics.likeCount AS like_count,
+    
+    -- Number of comments from YouTube API statistics (item.statistics.commentCount)
+    item.statistics.commentCount AS comment_count,
+    
+    -- Length of video title in characters (derived from item.snippet.title)
+    LENGTH(item.snippet.title) AS title_len,
+    
+    -- Length of video description in characters (derived from item.snippet.description)
+    LENGTH(item.snippet.description) AS description_len,
+    
+    -- SEO Score Calculation (0-100) - composite score based on multiple SEO factors
+    -- Derived metric combining: title presence, description presence, title length, tags, thumbnail
+    LEAST(100.0,
+      -- Title presence (20 points): title exists and is not empty
+      CASE WHEN item.snippet.title IS NOT NULL 
+        AND LENGTH(item.snippet.title) > 0 
+        THEN 20.0 ELSE 0.0 END +
+      -- Description presence (20 points): description exists and >50 chars, else 10 points
+      CASE WHEN item.snippet.description IS NOT NULL 
+        AND LENGTH(item.snippet.description) > 50 
+        THEN 20.0 ELSE 10.0 END +
+      -- Optimal title length 40-70 chars (20 points), else 10 points
+      CASE WHEN LENGTH(item.snippet.title) BETWEEN 40 AND 70 
+        THEN 20.0 ELSE 10.0 END +
+      -- Has tags (20 points): tags array exists
+      CASE WHEN item.snippet.tags IS NOT NULL 
+        THEN 20.0 ELSE 0.0 END +
+      -- Has custom thumbnail (20 points): maxres thumbnail URL exists
+      CASE WHEN item.snippet.thumbnails.maxres.url IS NOT NULL 
+        THEN 20.0 ELSE 0.0 END
+    ) AS seo_score,
+    
+    -- Date of data snapshot from bronze table struct (bronze.snapshot_date)
+    bronze.snapshot_date AS snapshot_date
 
+  FROM 
+    `tonal-transit-475913-a2.control.bronze_videos_external` AS bronze
+  CROSS JOIN UNNEST(bronze.items) AS item
+
+  WHERE
+    -- Only process records with valid video IDs
+    item.id IS NOT NULL
+    
+    -- Date filter: process specific date from DAG parameter (if provided)
+    ${ when(dataform.projectConfig.vars.target_date, 
+      `AND bronze.snapshot_date = PARSE_DATE('%Y-%m-%d', '${dataform.projectConfig.vars.target_date}')`
+    ) }
+    
+    -- Incremental mode: process last 7 days rolling window (if not full refresh and no target_date)
+    -- Only applies when: incremental mode AND no full_refresh variable AND no target_date
+    ${ when(incremental() && !dataform.projectConfig.vars.full_refresh && !dataform.projectConfig.vars.target_date, 
+      `AND bronze.snapshot_date >= DATE_SUB(CURRENT_DATE(), INTERVAL 7 DAY)`
+    ) }
+    -- If full_refresh is set or first run, process ALL dates from Bronze
+),
+
+/*
+ * Step 2: Deduplicate videos
+ * Removes duplicates when same video_id appears multiple times for the same snapshot_date
+ * Uses ROW_NUMBER() partitioned by video_id + snapshot_date
+ * Orders by view_count DESC (prefer videos with higher views), then published_at DESC (prefer newer videos)
+ */
+deduplicated_videos AS (
+  SELECT
+    *,
+    -- Row number for deduplication: 1 = keep, >1 = duplicate
+    ROW_NUMBER() OVER (
+      PARTITION BY video_id, snapshot_date 
+      ORDER BY view_count DESC, published_at DESC  -- Prefer higher views, then newer videos
+    ) AS rn
+  FROM unnested_videos
+)
+
+/*
+ * Step 3: Final SELECT
+ * Returns deduplicated video records with all metadata and SEO metrics
+ */
 SELECT
-  -- Identifiers
-  item.id AS video_id,
-  item.snippet.channelId AS channel_id,
+  -- Video identifier from unnested bronze data
+  video_id,
   
-  -- Metadata
-  item.snippet.title AS title,
-  item.snippet.description AS description,
-  item.snippet.publishedAt AS published_at,
+  -- Channel identifier from bronze table JSON
+  channel_id,
   
-  -- Duration (convert ISO 8601 to seconds)
-  CAST(
-    COALESCE(CAST(REGEXP_EXTRACT(item.contentDetails.duration, r'PT(\d+)H') AS INT64), 0) * 3600 +
-    COALESCE(CAST(REGEXP_EXTRACT(item.contentDetails.duration, r'(\d+)M') AS INT64), 0) * 60 +
-    COALESCE(CAST(REGEXP_EXTRACT(item.contentDetails.duration, r'(\d+)S') AS INT64), 0)
-  AS INT64) AS duration_sec,
+  -- Video title from unnested bronze data
+  title,
   
-  item.snippet.categoryId AS category_id,
+  -- Video description from unnested bronze data
+  description,
   
-  -- Content Flags
-  CASE 
-    WHEN ARRAY_LENGTH(item.snippet.tags) > 0 THEN TRUE 
-    ELSE FALSE 
-  END AS has_tags,
+  -- Video publish timestamp from unnested bronze data
+  published_at,
   
-  COALESCE(CAST(item.contentDetails.caption AS BOOL), FALSE) AS has_captions,
+  -- Video duration in seconds from unnested bronze data
+  duration_sec,
   
-  CASE 
-    WHEN item.snippet.thumbnails.maxres.url IS NOT NULL THEN TRUE 
-    ELSE FALSE 
-  END AS has_custom_thumbnail,
+  -- YouTube category ID from unnested bronze data
+  category_id,
   
-  -- Statistics
-  item.statistics.viewCount AS view_count,
-  item.statistics.likeCount AS like_count,
-  item.statistics.commentCount AS comment_count,
+  -- Boolean flag: has tags from unnested bronze data
+  has_tags,
   
-  -- Derived Fields
-  LENGTH(item.snippet.title) AS title_len,
-  LENGTH(item.snippet.description) AS description_len,
+  -- Boolean flag: has captions from unnested bronze data
+  has_captions,
   
-  -- SEO Score Calculation (0-100)
-  LEAST(100.0,
-    -- Title presence (20 points)
-    CASE WHEN item.snippet.title IS NOT NULL 
-      AND LENGTH(item.snippet.title) > 0 
-      THEN 20.0 ELSE 0.0 END +
-    -- Description presence (20 points)
-    CASE WHEN item.snippet.description IS NOT NULL 
-      AND LENGTH(item.snippet.description) > 50 
-      THEN 20.0 ELSE 0.0 END +
-    -- Optimal title length 40-70 chars (20 points)
-    CASE WHEN LENGTH(item.snippet.title) BETWEEN 40 AND 70 
-      THEN 20.0 ELSE 10.0 END +
-    -- Has tags (20 points)
-    CASE WHEN ARRAY_LENGTH(item.snippet.tags) > 0 
-      THEN 20.0 ELSE 0.0 END +
-    -- Has custom thumbnail (20 points)
-    CASE WHEN item.snippet.thumbnails.maxres.url IS NOT NULL 
-      THEN 20.0 ELSE 0.0 END
-  ) AS seo_score,
+  -- Boolean flag: has custom thumbnail from unnested bronze data
+  has_custom_thumbnail,
   
-  -- Partition Key (from Hive partition - already a DATE)
-  bronze.snapshot_date AS snapshot_date
+  -- View count from unnested bronze data
+  view_count,
+  
+  -- Like count from unnested bronze data
+  like_count,
+  
+  -- Comment count from unnested bronze data
+  comment_count,
+  
+  -- Title length in characters from unnested bronze data
+  title_len,
+  
+  -- Description length in characters from unnested bronze data
+  description_len,
+  
+  -- SEO score (0-100) from unnested bronze data
+  seo_score,
+  
+  -- Date of data snapshot from unnested bronze data
+  snapshot_date
 
-FROM 
-  `tonal-transit-475913-a2.control.bronze_videos_external` AS bronze
-CROSS JOIN UNNEST(bronze.items) AS item
-
+FROM deduplicated_videos
 WHERE
-  -- Only process records with valid video IDs
-  item.id IS NOT NULL
-  
-  -- Date filter: process specific date from DAG parameter
-  ${ when(dataform.projectConfig.vars.target_date, 
-    `AND bronze.snapshot_date = PARSE_DATE('%Y-%m-%d', '${dataform.projectConfig.vars.target_date}')`
-  ) }
-  
-  -- Incremental filter: only reprocess recent partitions if no target_date specified
-  ${ when(incremental() && !dataform.projectConfig.vars.target_date, 
-    `AND bronze.snapshot_date >= DATE_SUB(CURRENT_DATE(), INTERVAL 7 DAY)`) }
-
+  -- Only keep the first row per video_id + snapshot_date (deduplication filter)
+  rn = 1

@@ -21,24 +21,54 @@ config {
  * - is_current: Automatically set to FALSE for previous records when new record arrives
  * - created_at: Original video publish timestamp from source data (published_at)
  */
-
-WITH video_data AS (
-  SELECT
-    video_id,
-    channel_id,
-    title,
-    description,
-    published_at,
-    duration_sec,
-    has_tags,
-    has_custom_thumbnail,
-    has_captions,
-    title_len,
-    description_len,
-    seo_score,
-    snapshot_date
+WITH
+-- Get videos that have snapshots in the date range (for incremental efficiency)
+-- During incremental runs, only process entities that changed in last 7 days
+-- But include ALL historical snapshots for those entities (needed for SCD2)
+videos_in_range AS (
+  SELECT DISTINCT video_id
   FROM ${ref("silver", "silver_video")}
-  WHERE video_id IS NOT NULL
+  WHERE 
+    video_id IS NOT NULL
+    -- Date filter: process specific date from DAG parameter (if provided)
+    ${ when(dataform.projectConfig.vars.target_date, 
+      `AND snapshot_date = PARSE_DATE('%Y-%m-%d', '${dataform.projectConfig.vars.target_date}')`
+    ) }
+    -- Incremental mode: only process entities with snapshots in last 7 days
+    -- Only applies when: no full_refresh variable AND no target_date
+    ${ when(!dataform.projectConfig.vars.full_refresh && !dataform.projectConfig.vars.target_date, 
+      `AND snapshot_date >= DATE_SUB(CURRENT_DATE(), INTERVAL 7 DAY)`
+    ) }
+    -- If full_refresh is set, process ALL videos (no filter)
+),
+
+-- Get ALL historical data for videos in range (needed for complete SCD2 timelines)
+video_data AS (
+  SELECT
+    v.video_id,
+    v.channel_id,
+    v.title,
+    v.description,
+    v.published_at,
+    v.duration_sec,
+    v.has_tags,
+    v.has_custom_thumbnail,
+    v.has_captions,
+    v.title_len,
+    v.description_len,
+    v.seo_score,
+    v.snapshot_date
+  FROM ${ref("silver", "silver_video")} v
+  ${ when(!dataform.projectConfig.vars.full_refresh && !dataform.projectConfig.vars.target_date, 
+    `INNER JOIN videos_in_range vir ON v.video_id = vir.video_id`
+  ) }
+  WHERE 
+    v.video_id IS NOT NULL
+    -- Date filter: process specific date from DAG parameter (if provided)
+    ${ when(dataform.projectConfig.vars.target_date, 
+      `AND v.snapshot_date = PARSE_DATE('%Y-%m-%d', '${dataform.projectConfig.vars.target_date}')`
+    ) }
+    -- If full_refresh is set, process ALL dates from Silver (no filter)
 ),
 
 channel_lookup AS (

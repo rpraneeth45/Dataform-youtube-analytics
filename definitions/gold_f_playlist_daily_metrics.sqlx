@@ -5,6 +5,8 @@ config {
   description: "Playlist daily metrics (rolled up from videos)",
   tags: ["gold", "fact", "playlist", "metrics"],
   
+  uniqueKey: ["date_key", "playlist_sk"],
+  
   bigquery: {
     clusterBy: ["date_key", "playlist_sk"]
   }
@@ -21,9 +23,20 @@ WITH playlist_video_data AS (
     pv.video_id,
     pv.snapshot_date
   FROM ${ref("silver", "silver_playlist_video")} pv
-  WHERE pv.playlist_id IS NOT NULL 
+  WHERE 
+    pv.playlist_id IS NOT NULL 
     AND pv.video_id IS NOT NULL
     AND pv.is_current = TRUE
+    -- Date filter: process specific date from DAG parameter (if provided)
+    ${ when(dataform.projectConfig.vars.target_date, 
+      `AND pv.snapshot_date = PARSE_DATE('%Y-%m-%d', '${dataform.projectConfig.vars.target_date}')`
+    ) }
+    -- Incremental mode: process last 7 days rolling window (if not full refresh and no target_date)
+    -- Only applies when: incremental mode AND no full_refresh variable AND no target_date
+    ${ when(incremental() && !dataform.projectConfig.vars.full_refresh && !dataform.projectConfig.vars.target_date, 
+      `AND pv.snapshot_date >= DATE_SUB(CURRENT_DATE(), INTERVAL 7 DAY)`
+    ) }
+    -- If full_refresh is set or first run, process ALL dates from Silver
 ),
 
 video_metrics AS (
@@ -34,7 +47,18 @@ video_metrics AS (
     comment_count,
     snapshot_date
   FROM ${ref("silver", "silver_video")}
-  WHERE video_id IS NOT NULL
+  WHERE 
+    video_id IS NOT NULL
+    -- Date filter: process specific date from DAG parameter (if provided)
+    ${ when(dataform.projectConfig.vars.target_date, 
+      `AND snapshot_date = PARSE_DATE('%Y-%m-%d', '${dataform.projectConfig.vars.target_date}')`
+    ) }
+    -- Incremental mode: process last 7 days rolling window (if not full refresh and no target_date)
+    -- Only applies when: incremental mode AND no full_refresh variable AND no target_date
+    ${ when(incremental() && !dataform.projectConfig.vars.full_refresh && !dataform.projectConfig.vars.target_date, 
+      `AND snapshot_date >= DATE_SUB(CURRENT_DATE(), INTERVAL 7 DAY)`
+    ) }
+    -- If full_refresh is set or first run, process ALL dates from Silver
 ),
 
 playlist_lookup AS (

@@ -1,0 +1,30 @@
+config {
+  type: "view",
+  schema: "reporting",
+  name: "rv_channel_playlist_videos",
+  description: "Number of Videos per Playlist - Table for Channel Overview Dashboard",
+  tags: ["reporting", "channel", "playlist", "dashboard"]
+}
+
+/*
+ * Channel Playlist Videos View
+ * 
+ * Purpose: Returns number of videos per playlist for Channel Overview dashboard table
+ * 
+ * Source: silver.silver_playlist
+ */
+
+WITH latest_snapshot AS (
+  SELECT MAX(snapshot_date) AS max_date
+  FROM ${ref("silver", "silver_playlist")}
+)
+SELECT 
+  sp.playlist_id,
+  sp.title AS playlist_title,
+  sp.channel_id,
+  sp.item_count AS number_of_videos
+FROM ${ref("silver", "silver_playlist")} sp
+CROSS JOIN latest_snapshot ls
+WHERE sp.snapshot_date = ls.max_date
+ORDER BY sp.channel_id, sp.item_count DESC
+

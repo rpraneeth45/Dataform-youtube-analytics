@@ -1,0 +1,37 @@
+config {
+  type: "view",
+  schema: "reporting",
+  name: "rv_seo_top_channels",
+  description: "Top 5 Performing Channels by SEO Score - Bar Chart for SEO Dashboard",
+  tags: ["reporting", "seo", "channels", "dashboard"]
+}
+
+/*
+ * Top 5 Channels by SEO Score View
+ * 
+ * Purpose: Returns top 5 channels by average SEO score for bar chart
+ * 
+ * Source: silver.silver_video, silver.silver_channel
+ */
+
+WITH latest_snapshot AS (
+  SELECT MAX(snapshot_date) AS max_date
+  FROM ${ref("silver", "silver_video")}
+),
+channel_seo AS (
+  SELECT 
+    sv.channel_id,
+    sc.channel_title,
+    AVG(sv.seo_score) AS avg_seo_score
+  FROM ${ref("silver", "silver_video")} sv
+  JOIN ${ref("silver", "silver_channel")} sc
+    ON sv.channel_id = sc.channel_id
+    AND sv.snapshot_date = sc.snapshot_date
+  CROSS JOIN latest_snapshot ls
+  WHERE sv.snapshot_date = ls.max_date
+  GROUP BY sv.channel_id, sc.channel_title
+)
+SELECT * FROM channel_seo
+ORDER BY avg_seo_score DESC
+LIMIT 5
+

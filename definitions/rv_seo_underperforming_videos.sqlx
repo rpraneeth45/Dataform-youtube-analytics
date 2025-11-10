@@ -1,0 +1,36 @@
+config {
+  type: "view",
+  schema: "reporting",
+  name: "rv_seo_underperforming_videos",
+  description: "Underperforming Videos by SEO Score - Table for SEO Dashboard",
+  tags: ["reporting", "seo", "videos", "dashboard"]
+}
+
+/*
+ * Underperforming Videos by SEO Score View
+ * 
+ * Purpose: Returns videos with SEO score below 70
+ * 
+ * Source: silver.silver_video
+ */
+
+WITH latest_snapshot AS (
+  SELECT MAX(snapshot_date) AS max_date
+  FROM ${ref("silver", "silver_video")}
+)
+SELECT 
+  video_id,
+  title AS video_title,
+  channel_id,
+  seo_score,
+  has_tags,
+  has_captions AS has_caption,
+  has_custom_thumbnail AS has_thumbnail,
+  title_len AS title_length,
+  description_len AS description_length
+FROM ${ref("silver", "silver_video")}
+CROSS JOIN latest_snapshot ls
+WHERE snapshot_date = ls.max_date
+  AND seo_score < 70
+ORDER BY seo_score ASC
+

@@ -1,0 +1,59 @@
+config {
+  type: "view",
+  schema: "reporting",
+  name: "rv_mcn_overview",
+  description: "MCN Overview Dashboard - Total Channels, Total Videos, Avg SEO Score",
+  tags: ["reporting", "mcn", "overview", "dashboard"]
+}
+
+/*
+ * MCN Overview Dashboard View
+ * 
+ * Purpose: Returns MCN-level aggregated metrics
+ * - Total Channels
+ * - Total Videos
+ * - Average SEO Score
+ * 
+ * Source: silver.silver_channel, silver.silver_mcn_group, silver.silver_video
+ */
+
+WITH latest_snapshot AS (
+  SELECT MAX(snapshot_date) AS max_date
+  FROM ${ref("silver", "silver_channel")}
+),
+channel_latest AS (
+  SELECT 
+    sc.channel_id,
+    sc.mcn_group_id,
+    sc.video_count_total,
+    smg.mcn_group_name
+  FROM ${ref("silver", "silver_channel")} sc
+  LEFT JOIN ${ref("silver", "silver_mcn_group")} smg
+    ON sc.mcn_group_id = smg.mcn_group_id
+    AND sc.snapshot_date = smg.snapshot_date
+  CROSS JOIN latest_snapshot ls
+  WHERE sc.snapshot_date = ls.max_date
+),
+video_seo_agg AS (
+  SELECT 
+    sv.channel_id,
+    AVG(sv.seo_score) AS avg_seo_score
+  FROM ${ref("silver", "silver_video")} sv
+  CROSS JOIN latest_snapshot ls
+  WHERE sv.snapshot_date = ls.max_date
+  GROUP BY sv.channel_id
+),
+mcn_metrics AS (
+  SELECT 
+    cl.mcn_group_id,
+    cl.mcn_group_name,
+    COUNT(DISTINCT cl.channel_id) AS total_channels,
+    SUM(cl.video_count_total) AS total_videos,
+    AVG(vsa.avg_seo_score) AS avg_seo_score
+  FROM channel_latest cl
+  LEFT JOIN video_seo_agg vsa
+    ON cl.channel_id = vsa.channel_id
+  GROUP BY cl.mcn_group_id, cl.mcn_group_name
+)
+SELECT * FROM mcn_metrics
+

@@ -1,0 +1,31 @@
+config {
+  type: "view",
+  schema: "reporting",
+  name: "rv_seo_top_videos",
+  description: "Top 5 Performing Videos by SEO Score - Bar Chart for SEO Dashboard",
+  tags: ["reporting", "seo", "videos", "dashboard"]
+}
+
+/*
+ * Top 5 Videos by SEO Score View
+ * 
+ * Purpose: Returns top 5 videos by SEO score for bar chart
+ * 
+ * Source: silver.silver_video
+ */
+
+WITH latest_snapshot AS (
+  SELECT MAX(snapshot_date) AS max_date
+  FROM ${ref("silver", "silver_video")}
+)
+SELECT 
+  video_id,
+  title AS video_title,
+  channel_id,
+  seo_score
+FROM ${ref("silver", "silver_video")}
+CROSS JOIN latest_snapshot ls
+WHERE snapshot_date = ls.max_date
+ORDER BY seo_score DESC
+LIMIT 5
+

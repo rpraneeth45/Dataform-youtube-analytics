@@ -1,0 +1,55 @@
+config {
+  type: "view",
+  schema: "reporting",
+  name: "rv_channel_overview",
+  description: "Channel Overview Dashboard - 4 KPIs: Total Views, Total Subscribers, Total Videos, Total Playlists",
+  tags: ["reporting", "channel", "overview", "dashboard"]
+}
+
+/*
+ * Channel Overview Dashboard View
+ * 
+ * Purpose: Returns latest channel KPIs for Channel Overview dashboard
+ * - Total Views
+ * - Total Subscribers
+ * - Total Videos
+ * - Total Playlists
+ * 
+ * Source: silver.silver_channel, silver.silver_playlist
+ */
+
+WITH latest_snapshot AS (
+  SELECT MAX(snapshot_date) AS max_date
+  FROM ${ref("silver", "silver_channel")}
+),
+channel_latest AS (
+  SELECT 
+    channel_id,
+    channel_title,
+    subscriber_count AS total_subscribers,
+    view_count_total AS total_views,
+    video_count_total AS total_videos
+  FROM ${ref("silver", "silver_channel")}
+  CROSS JOIN latest_snapshot ls
+  WHERE snapshot_date = ls.max_date
+),
+playlist_counts AS (
+  SELECT 
+    channel_id,
+    COUNT(DISTINCT playlist_id) AS total_playlists
+  FROM ${ref("silver", "silver_playlist")}
+  CROSS JOIN latest_snapshot ls
+  WHERE snapshot_date = ls.max_date
+  GROUP BY channel_id
+)
+SELECT 
+  cl.channel_id,
+  cl.channel_title,
+  cl.total_subscribers,
+  cl.total_views,
+  cl.total_videos,
+  COALESCE(pc.total_playlists, 0) AS total_playlists
+FROM channel_latest cl
+LEFT JOIN playlist_counts pc
+  ON cl.channel_id = pc.channel_id
+
